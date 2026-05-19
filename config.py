@@ -22,11 +22,11 @@ class Config:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Swin encoder
-    swin_embed_dim = 96
+    swin_embed_dim = 48
     swin_depths = [2, 2, 2, 2]       # num blocks per stage (A2GS style)
     swin_num_heads = [3, 6, 12, 24]   # heads per stage
     swin_window_size = 7
-    swin_mlp_ratio = 4.0
+    swin_mlp_ratio = 2.0
     swin_drop_path_rate = 0.1         # stochastic depth
 
     # fusion

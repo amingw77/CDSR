@@ -342,13 +342,12 @@ class SwinEncoder(nn.Module):
                 window_size=window_size,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
-                do_merge=(i > 0),
+                do_merge=False,
                 drop_path_rates=stage_dpr,
             )
             self.stages.append(stage)
-            dim = dim * 2 if i > 0 else dim
 
-        self.out_dims = [embed_dim * (2 ** max(0, i)) for i in range(len(depths))]
+        self.out_dims = [embed_dim] * len(depths)
         self._init_weights()
 
     def _init_weights(self):

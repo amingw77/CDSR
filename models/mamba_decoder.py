@@ -1,6 +1,7 @@
 """
 Mamba-based reconstruction decoder for depth map super-resolution.
-Uses 2D selective scan (SS2D) blocks with progressive upsampling.
+Uses 2D selective scan (SS2D) blocks for global context refinement,
+then PixelShuffle upsampling to HR resolution.
 """
 import torch
 import torch.nn as nn
@@ -63,72 +64,35 @@ class MambaBlock(nn.Module):
         return shortcut + self.alpha * out
 
 
-class UpBlock(nn.Module):
-    """Upsampling block with Mamba + skip connection."""
-
-    def __init__(self, in_dim: int, skip_dim: int, out_dim: int,
-                 d_state: int = 16, expand: int = 2):
-        super().__init__()
-        self.upsample = nn.Sequential(
-            nn.Conv2d(in_dim, out_dim * 4, 3, padding=1),
-            nn.PixelShuffle(2),
-        )
-        self.skip_proj = nn.Conv2d(skip_dim, out_dim, 1, bias=False) if skip_dim != out_dim else nn.Identity()
-        self.mamba = MambaBlock(out_dim, d_state, expand)
-        self.conv = nn.Sequential(
-            nn.Conv2d(out_dim, out_dim, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(out_dim, out_dim, 3, padding=1),
-        )
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor):
-        x = self.upsample(x)
-        skip = self.skip_proj(skip)
-
-        # Align spatial dims
-        if x.shape[2:] != skip.shape[2:]:
-            x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=False)
-
-        x = x + skip
-        x = self.mamba(x)
-        x = self.conv(x) + x
-        return x
-
-
 class MambaDecoder(nn.Module):
-    """Mamba-based U-Net decoder with progressive upsampling for depth map reconstruction.
+    """Mamba-based decoder for depth map reconstruction.
 
-    Takes multi-scale fused features from A²GSTran fusion,
-    progressively upsamples from coarsest to finest scale,
-    with Mamba blocks at each level for global context.
+    Takes multi-scale fused features (all at same H/4 resolution),
+    concatenates them, refines with Mamba blocks, and upsamples to HR.
     """
 
     def __init__(self, feature_dims: list, scale: int = 8,
                  d_state: int = 16, expand: int = 2):
         super().__init__()
-        # feature_dims: [C0, C1, C2, C3] from coarsest to finest (Swin stages)
-        self.scale = scale
-        dims = feature_dims[::-1]  # reverse: coarsest first
+        total_dim = sum(feature_dims)
+        base_dim = feature_dims[0]
 
-        # Bottleneck
-        self.bottleneck = nn.Sequential(
-            MambaBlock(dims[0], d_state, expand),
-            MambaBlock(dims[0], d_state, expand),
+        # Fuse concatenated features
+        self.fuse = nn.Sequential(
+            nn.Conv2d(total_dim, base_dim * 2, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(base_dim * 2, base_dim, 3, padding=1),
         )
 
-        # Up blocks (3 stages: S4→S3→S2→S1, each ×2 upsample)
-        self.up_blocks = nn.ModuleList()
-        cur_dim = dims[0]
-        for i in range(1, len(dims)):
-            self.up_blocks.append(
-                UpBlock(cur_dim, dims[i], dims[i], d_state, expand)
-            )
-            cur_dim = dims[i]
+        # Mamba refinement blocks
+        self.mamba_blocks = nn.Sequential(
+            MambaBlock(base_dim, d_state, expand),
+            MambaBlock(base_dim, d_state, expand),
+        )
 
-        # Final upsampling: S1 (H/4) → HR (H), needs ×4 upsampling
-        # because PatchEmbed uses stride=4
+        # Final upsampling: H/4 → H (×4 PixelShuffle)
         self.final_ups = nn.Sequential(
-            nn.Conv2d(cur_dim, 64, 3, padding=1),
+            nn.Conv2d(base_dim, 64, 3, padding=1),
             nn.GELU(),
             nn.Conv2d(64, 64, 3, padding=1),
             nn.GELU(),
@@ -137,19 +101,13 @@ class MambaDecoder(nn.Module):
             nn.Conv2d(1, 1, 3, padding=1),
         )
 
-    def forward(self, features: list, encoder_depth_features: list):
+    def forward(self, features: list, encoder_depth_features: list = None):
         """
-        features: list of fused features (B, C_i, H_i, W_i) from coarsest to finest
-        encoder_depth_features: same order, for skip connections
-        Returns: HR depth (B, 1, H, W)
+        features: list of (B, C, H, W) at same spatial resolution
+        Returns: HR depth (B, 1, H*4, W*4)
         """
-        rev_feats = features[::-1]
-        rev_skips = encoder_depth_features[::-1]
-
-        x = self.bottleneck(rev_feats[0])
-
-        for i, up in enumerate(self.up_blocks):
-            x = up(x, rev_skips[i + 1])
-
+        x = torch.cat(features, dim=1)
+        x = self.fuse(x)
+        x = self.mamba_blocks(x)
         x = self.final_ups(x)
         return x
