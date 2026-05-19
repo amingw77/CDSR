@@ -23,7 +23,7 @@ class Config:
 
     # Swin encoder
     swin_embed_dim = 96
-    swin_depths = [2, 2, 6, 2]       # num blocks per stage
+    swin_depths = [2, 2, 2, 2]       # num blocks per stage (A2GS style)
     swin_num_heads = [3, 6, 12, 24]   # heads per stage
     swin_window_size = 7
     swin_mlp_ratio = 4.0

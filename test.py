@@ -1,6 +1,6 @@
 """
 Evaluation script for CDSR-Net: compute metrics and visualize results.
-Saves prediction, GT, and error maps for all test images (A2GS style).
+Saves LR depth, RGB guide, prediction, GT, and error maps for all test images.
 """
 import os
 import sys
@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast
 import numpy as np
 import matplotlib.pyplot as plt
+from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,7 +24,7 @@ from utils.metrics import compute_rmse, compute_mae, compute_rel, compute_delta
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, results_dir: str = None):
+def evaluate(model, loader, dataset, device, results_dir: str = None):
     model.eval()
     metrics = {"rmse": [], "mae": [], "rel": [], "delta1": []}
 
@@ -31,7 +32,9 @@ def evaluate(model, loader, device, results_dir: str = None):
         pred_dir = os.path.join(results_dir, "pred")
         gt_dir = os.path.join(results_dir, "gt")
         error_dir = os.path.join(results_dir, "error")
-        for d in [pred_dir, gt_dir, error_dir]:
+        lr_dir = os.path.join(results_dir, "lr")
+        rgb_dir = os.path.join(results_dir, "rgb")
+        for d in [pred_dir, gt_dir, error_dir, lr_dir, rgb_dir]:
             os.makedirs(d, exist_ok=True)
 
     pbar = tqdm(enumerate(loader), total=len(loader), desc="Test")
@@ -61,9 +64,9 @@ def evaluate(model, loader, device, results_dir: str = None):
         # Save visualizations
         if results_dir:
             pred_np = p.squeeze().cpu().numpy()
-            t_np = t.squeeze().cpu().numpy()
-            dm_np = dm.cpu().numpy()
-            dx_np = dx.cpu().numpy()
+            t_np = t.squeeze().cpu().float().numpy()
+            dm_np = dm.cpu().float().numpy()
+            dx_np = dx.cpu().float().numpy()
 
             # De-normalize to cm
             pred_cm = pred_np * (dx_np - dm_np) + dm_np
@@ -79,6 +82,19 @@ def evaluate(model, loader, device, results_dir: str = None):
                        gt_cm, vmin=vmin, vmax=vmax, cmap="jet")
             plt.imsave(os.path.join(error_dir, f"{i:04d}.png"),
                        error_cm, cmap="hot")
+
+            # LR depth: upscale from 28×28 to HR, de-normalize to cm
+            lr_np = lr_depth[0, 0].cpu().float().numpy()
+            lr_cm = lr_np * (dx_np - dm_np) + dm_np
+            lr_cm_hr = np.array(Image.fromarray(lr_cm).resize(
+                (gt_cm.shape[1], gt_cm.shape[0]), Image.BICUBIC))
+            plt.imsave(os.path.join(lr_dir, f"{i:04d}.png"),
+                       lr_cm_hr, vmin=vmin, vmax=vmax, cmap="jet")
+
+            # Original RGB: load from disk
+            rgb_path, _ = dataset.samples[i]
+            rgb_orig = np.array(Image.open(rgb_path).convert("RGB"))  # uint8 HWC
+            plt.imsave(os.path.join(rgb_dir, f"{i:04d}.png"), rgb_orig)
 
     for k in metrics:
         v = np.array(metrics[k])
@@ -121,12 +137,13 @@ def main():
     results_dir = None if args.no_save else (
         args.results_dir or os.path.join(os.path.dirname(args.checkpoint), "results")
     )
-    results = evaluate(model, loader, device, results_dir)
+    results = evaluate(model, loader, dataset, device, results_dir)
 
     print(f"\n[Results] RMSE: {results['rmse']:.4f}  MAE: {results['mae']:.4f}  "
           f"Rel: {results['rel']:.4f}  δ1: {results['delta1']:.1f}%")
     if results_dir:
-        print(f"[Saved] {results_dir}/pred/  {results_dir}/gt/  {results_dir}/error/")
+        print(f"[Saved] {results_dir}/pred/  {results_dir}/gt/  {results_dir}/error/  "
+              f"{results_dir}/lr/  {results_dir}/rgb/")
 
 
 if __name__ == "__main__":
