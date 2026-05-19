@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import StepLR
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
@@ -131,6 +131,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=cfg.batch_size)
     parser.add_argument("--epochs", type=int, default=cfg.num_epochs)
     parser.add_argument("--lr", type=float, default=cfg.lr)
+    parser.add_argument("--lr_step", type=int, default=cfg.lr_step)
+    parser.add_argument("--lr_gamma", type=float, default=cfg.lr_gamma)
     parser.add_argument("--scale", type=int, default=cfg.scale)
     parser.add_argument("--crop_size", type=int, default=cfg.crop_size)
     parser.add_argument("--resume", type=str, default=None)
@@ -192,7 +194,7 @@ def main():
 
     # Optimizer
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=cfg.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+    scheduler = StepLR(optimizer, step_size=args.lr_step, gamma=args.lr_gamma)
     scaler = GradScaler()
 
     start_epoch = 0
