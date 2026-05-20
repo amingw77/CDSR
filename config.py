@@ -42,6 +42,9 @@ class Config:
     loss_l1_weight = 1.0
     loss_edge_weight = 0.5
 
+    # version tag (saved in checkpoints, printed in logs)
+    model_version = "4.1"
+
     # checkpoint (portable: relative to project root)
     checkpoint_dir = os.path.join(_project_root, "checkpoints")
     log_dir = os.path.join(_project_root, "logs")

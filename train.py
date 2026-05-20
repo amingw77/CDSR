@@ -116,6 +116,7 @@ def validate(model, loader, device):
 
 def save_checkpoint(save_path, epoch, model, optimizer, scheduler, best_rmse):
     torch.save({
+        "version": cfg.model_version,
         "epoch": epoch,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -147,6 +148,9 @@ def main():
     tee = TeeLogger(log_path)
     sys.stdout = tee
 
+    print(f"========================================================")
+    print(f"  CDSR-Net v{cfg.model_version}")
+    print(f"========================================================")
     print(f"[Log] {log_path}")
     print(f"[Checkpoint Dir] {cfg.checkpoint_dir}")
     print(f"[Data Root] {args.data_root}")
@@ -202,6 +206,8 @@ def main():
     if args.resume:
         print(f"[Resume] Loading {args.resume}...")
         ckpt = torch.load(args.resume, map_location=device)
+        ckpt_version = ckpt.get("version", "unknown")
+        print(f"[Resume] Checkpoint version: v{ckpt_version}")
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
