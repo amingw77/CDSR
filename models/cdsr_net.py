@@ -1,6 +1,6 @@
 """
-CDSR-Net v4.1: Color-guided Depth Super-Resolution Network.
-A2GS-style interleaved cross-attention → dual branch decoders → CBAM fusion.
+CDSR-Net v4.2: Color-guided Depth Super-Resolution Network.
+A2GS-style interleaved cross-attention → dual Mamba → cross-attn fusion.
 
 Architecture (20 SwinBlocks total):
   depth PatchEmbed ──┐                            RGB PatchEmbed ──┐
@@ -15,9 +15,9 @@ Architecture (20 SwinBlocks total):
                       │     g3                          │            │
                       └───────┼── cross_c3 ──→ rgb_stage4 ─→ g4   │
                               │                                     │
-                         DepthDecoder                       RGBDecoder
+                          MambaBlock                         MambaBlock
                               │                                     │
-                              └──→ Concat → CBAM(+res) → Conv → HR Depth
+                              └──→ CrossAttn(depth Q, RGB KV) ─→ Upsample → HR
 """
 import torch
 import torch.nn as nn
@@ -78,10 +78,12 @@ class CBAM(nn.Module):
 
 
 class CDSRNet(nn.Module):
-    """CDSR-Net v4.1: A2GS interleaved cross-attention + dual decoders + CBAM.
+    """CDSR-Net v4.2: A2GS interleaved cross-attention + dual Mamba + cross-attn fusion.
 
     5 depth stages + 5 RGB stages (2 SwinBlocks each = 20 total),
     4 cross_d + 4 cross_c blocks in A2GS interleaved order.
+    Dual MambaBlocks refine features, then cross-attention (depth Q, RGB KV)
+    fuses the two branches before upsampling to HR.
     """
 
     def __init__(self,
@@ -160,13 +162,24 @@ class CDSRNet(nn.Module):
                                               fusion_num_heads, cross_mlp_ratio)
                 )
 
-        # Dual branch decoders (weights NOT shared)
-        self.depth_decoder = BranchDecoder(embed_dim, d_state, expand)
-        self.rgb_decoder = BranchDecoder(embed_dim, d_state, expand)
+        # Dual MambaBlocks (unshared, for depth and RGB branch refinement)
+        self.depth_mamba = MambaBlock(embed_dim, d_state, expand)
+        self.rgb_mamba = MambaBlock(embed_dim, d_state, expand)
 
-        # CBAM fusion with residual
-        self.cbam = CBAM(2)
-        self.final_conv = nn.Conv2d(2, 1, 3, padding=1)
+        # Cross-attention fusion: depth features as Q, RGB features as K/V
+        self.fusion_cross = A2GSCrossTransformerBlock(embed_dim, embed_dim,
+                                                      fusion_num_heads, cross_mlp_ratio)
+
+        # Upsampling: H/4 → H
+        self.upsample = nn.Sequential(
+            nn.Conv2d(embed_dim, 64, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(64, 16, 3, padding=1),
+            nn.PixelShuffle(4),
+            nn.Conv2d(1, 1, 3, padding=1),
+        )
 
     def forward(self, lr_depth: torch.Tensor, rgb: torch.Tensor):
         B, _, H_lr, W_lr = lr_depth.shape
@@ -197,14 +210,22 @@ class CDSRNet(nn.Module):
             y = self.cross_c_blocks[i](y, x, x_size)          # RGB Q, depth KV
             y, _, _ = self.rgb_stages[i + 1](y, H, W)         # g_{i+1}
 
-        # Decode each branch
-        d_out = self.depth_decoder(x, H, W)
-        r_out = self.rgb_decoder(y, H, W)
+        # Mamba refinement on each branch
+        x_2d = x.transpose(1, 2).contiguous().view(B, -1, H, W)
+        y_2d = y.transpose(1, 2).contiguous().view(B, -1, H, W)
+        x_mamba = self.depth_mamba(x_2d)
+        y_mamba = self.rgb_mamba(y_2d)
 
-        # CBAM fusion with residual
-        cat = torch.cat([d_out, r_out], dim=1)
-        fused = self.cbam(cat) + cat
-        out = self.final_conv(fused)
+        # Back to sequence format for cross-attention
+        x_seq = x_mamba.flatten(2).transpose(1, 2)
+        y_seq = y_mamba.flatten(2).transpose(1, 2)
+
+        # Cross-attention fusion: depth Q, RGB KV
+        fused = self.fusion_cross(x_seq, y_seq, x_size)
+
+        # Upsample to HR
+        fused_2d = fused.transpose(1, 2).contiguous().view(B, -1, H, W)
+        out = self.upsample(fused_2d)
 
         # Global residual: bicubic upsampled LR depth
         out = out + lr_depth_hr
