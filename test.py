@@ -77,9 +77,9 @@ def evaluate(model, loader, dataset, device, results_dir: str = None):
             vmin, vmax = gt_cm.min(), gt_cm.max()
 
             plt.imsave(os.path.join(pred_dir, f"{i:04d}.png"),
-                       pred_cm, vmin=vmin, vmax=vmax, cmap="jet")
+                       pred_cm, vmin=vmin, vmax=vmax, cmap="gray")
             plt.imsave(os.path.join(gt_dir, f"{i:04d}.png"),
-                       gt_cm, vmin=vmin, vmax=vmax, cmap="jet")
+                       gt_cm, vmin=vmin, vmax=vmax, cmap="gray")
             plt.imsave(os.path.join(error_dir, f"{i:04d}.png"),
                        error_cm, cmap="hot")
 
@@ -89,7 +89,7 @@ def evaluate(model, loader, dataset, device, results_dir: str = None):
             lr_cm_hr = np.array(Image.fromarray(lr_cm).resize(
                 (gt_cm.shape[1], gt_cm.shape[0]), Image.BICUBIC))
             plt.imsave(os.path.join(lr_dir, f"{i:04d}.png"),
-                       lr_cm_hr, vmin=vmin, vmax=vmax, cmap="jet")
+                       lr_cm_hr, vmin=vmin, vmax=vmax, cmap="gray")
 
             # Original RGB: load from disk
             rgb_path, _ = dataset.samples[i]
