@@ -1,6 +1,6 @@
-# CDSR-Net v3.0: Lightweight Color-guided Depth Super-Resolution
+# CDSR-Net v4.2: Color-guided Depth Super-Resolution Network
 
-Swin Transformer → A2GS 交错交叉注意力 → Mamba 解码器
+Swin Transformer → A2GS 交错交叉注意力 → 双 Mamba → 交叉注意力融合
 
 ---
 
@@ -18,7 +18,7 @@ Swin Transformer → A2GS 交错交叉注意力 → Mamba 解码器
                     │ 1→48ch    │                       │ 3→48ch    │
                     │ stride=4  │                       │ stride=4  │
                     └────┬────┘                        └────┬────┘
-                         │ (B,3136,48)  H/4               │ (B,3136,48)
+                         │ (B,N,48) H/4×W/4               │ (B,N,48)
                          │                                  │
      ╔═══════════════════╪══════════════════════════════════╪═══════════╗
      ║ STAGE 0           ▼                                  ▼           ║
@@ -61,39 +61,33 @@ Swin Transformer → A2GS 交错交叉注意力 → Mamba 解码器
      ║                              │ g1                                ║
      ╚══════════════════════════════╪═══════════════════════════════════╝
                                     │
-          ┌─────────────┬───────────┼───────────┬─────────────┐
-          │             │           │           │             │
-          ▼ d0          ▼ d1        ▼           ▼ d2         ▼ d3
-    (B,48,H/4,W/4) (B,48,H/4,W/4)  ...    (B,48,H/4,W/4) (B,48,H/4,W/4)
-          │             │           │           │             │
-          └─────────────┴───────────┴───────────┴─────────────┘
+                          (重复 3 次，共 4 组)
                                     │
-                            (B,192,H/4,W/4)
-                                    │
-                         ┌──────────┴──────────┐
-                         │  Mamba Decoder       │
-                         │                      │
-                         │  Conv(192→48)        │
-                         │  MambaBlock ×2       │
-                         │  Conv(48→64→64→16)   │
-                         │  PixelShuffle(×4)    │
-                         │  Conv(1→1)           │
-                         └──────────┬──────────┘
-                                    │
-                              (B,1,H,W)
-                          Super-Resolved Depth
+                    ┌───────────────┴───────────────┐
+                    │ d4 (B,N,48)                   │ g4 (B,N,48)
+                    │                               │
+                    ▼                               ▼
+             MambaBlock                       MambaBlock
+             (SS2D, 5方向扫描)               (SS2D, 5方向扫描)
+             (B,48,H/4,W/4)                  (B,48,H/4,W/4)
+                    │                               │
+                    └───────────┬───────────────────┘
+                                ▼
+                   CrossAttention (depth Q, RGB KV)
+                   Conv2d + DWConv + Cosine + Temp
+                                │
+                           (B,N,48)
+                                │
+                   Upsample: Conv(48→64→64→16)
+                             PixelShuffle(×4)
+                             Conv(1→1,3×3)
+                                │
+                           (B,1,H,W)
+                                │
+                          + lr_depth_hr
+                                ▼
+                      Super-Resolved Depth
 ```
-
-### 关键变化 (v3.0 vs v2.0)
-
-| 项目 | v2.0 | v3.0 |
-|------|------|------|
-| embed_dim | 96 | 48 |
-| mlp_ratio | 4.0 | 2.0 |
-| PatchMerging | 4级层级下采样 | 无，全阶段同分辨率 |
-| 交叉注意力 | 4 cross_d + 3 cross_c | 3 cross_d + 2 cross_c（交错） |
-| 解码器 | 多尺度 U-Net | 同分辨率 concat + Mamba |
-| 参数量 | 74.60M | 0.71M |
 
 ---
 
@@ -108,24 +102,25 @@ Swin Transformer → A2GS 交错交叉注意力 → Mamba 解码器
 | Stage 1 | 2 | 6 | 7 | 48 | H/4 × W/4 |
 | Stage 2 | 2 | 12 | 7 | 48 | H/4 × W/4 |
 | Stage 3 | 2 | 24 | 7 | 48 | H/4 × W/4 |
+| Stage 4 | 2 | 24 | 7 | 48 | H/4 × W/4 |
 
-所有阶段无 PatchMerging，同分辨率同维度。深度编码器 4 个阶段，RGB 编码器 3 个阶段（g3 无下游消费者）。
+两个分支各有 5 个 stage，共 20 个 SwinBlock。所有 stage 无 PatchMerging，同分辨率同维度。
 
 ### SwinBlock 内部
 
 ```
-x → LN → W-MSA/SW-MSA (窗口7×7) → +shortcut → LN → MLP(DWConv) → +shortcut → out
+x → LN → W-MSA/SW-MSA (窗口7×7) → +shortcut → LN → MLP → +shortcut → out
                                                     │
                                                     ├─ Linear(dim → dim*mlp_ratio)
                                                     ├─ GELU
-                                                    ├─ DWConv3×3 (空间局部混合)
-                                                    ├─ GELU
-                                                    └─ Linear(dim*mlp_ratio → dim)
+                                                    ├─ Dropout
+                                                    ├─ Linear(dim*mlp_ratio → dim)
+                                                    └─ Dropout
 ```
 
 ---
 
-## 三、A2GS 交错交叉注意力
+## 三、A2GS 交错交叉注意力（编码器内）
 
 ### 模式
 
@@ -141,21 +136,27 @@ d0, g0 (Stage0 输出)
   → Stage2 RGB → g2
   → cross_d2: depth(Q) ← RGB(K/V) → d2'
   → Stage3 depth → d3
+  → cross_c2: RGB(Q) ← depth(K/V) → g2'
+  → Stage3 RGB → g3
+  → cross_d3: depth(Q) ← RGB(K/V) → d3'
+  → Stage4 depth → d4
+  → cross_c3: RGB(Q) ← depth(K/V) → g3'
+  → Stage4 RGB → g4
 ```
 
-3 对 cross_d（深度查询 RGB）+ 2 对 cross_c（RGB 查询深度），最后一对 cross_c 省略（g3 无下游消费者）。
+4 对 cross_d + 4 对 cross_c，交错执行，每对交叉注意力的 Q 源交替互换。
 
 ### A2GSCrossAttention 细节
 
 ```
-Q (depth): Conv1×1(48→48) → DWConv3×3 → L2-normalize
-K,V (RGB): Conv1×1(48→96) → DWConv3×3 → chunk2 → K: L2-normalize, V: 直接使用
+Q: Conv1×1(48→48) → DWConv3×3 → L2-normalize
+K,V: Conv1×1(48→96) → DWConv3×3 → chunk2 → K: L2-normalize, V: 直接使用
 
 Attn = softmax(Q @ K^T * temperature)
 Out = Attn @ V → Conv1×1(48→48) → 输出序列格式
 ```
 
-- temperature: 可学习参数 (num_heads, 1, 1)
+- temperature: 可学习参数 `(num_heads, 1, 1)`
 - 余弦相似度通过 L2 归一化实现
 
 ### A2GSCrossTransformerBlock
@@ -164,45 +165,76 @@ Out = Attn @ V → Conv1×1(48→48) → 输出序列格式
 x → LN_Q(x) + LN_KV(y) → CrossAttention → +shortcut(x) → LN → MLP(DWConv) → +shortcut → out
 ```
 
+MLP 使用 A2GSMlp：Linear → GELU → DWConv3×3 → GELU → Dropout → Linear → Dropout
+
 ---
 
-## 四、Mamba 解码器
+## 四、解码器：双 Mamba + 交叉注意力融合
+
+### 流程
 
 ```
-Concat(d0,d1,d2,d3)  (B,192,H/4,W/4)
-        │
-   Conv(192→96,3×3) → GELU → Conv(96→48,3×3)
-        │
-   MambaBlock(dim=48, expand=2) ×2
-        │
-   Conv(48→64) → GELU → Conv(64→64) → GELU → Conv(64→16)
-        │
-   PixelShuffle(×4)    16ch → 1ch
-        │
-   Conv(1→1,3×3)
-        │
-   (B,1,H,W)  HR Depth
+d4 (B,N,48)                            g4 (B,N,48)
+  │                                      │
+  │ reshape → (B,48,H/4,W/4)             │ reshape → (B,48,H/4,W/4)
+  ▼                                      ▼
+MambaBlock (depth)                   MambaBlock (rgb)
+(5方向SS2D扫描)                      (5方向SS2D扫描)
+  │                                      │
+  │ flatten → (B,N,48)                   │ flatten → (B,N,48)
+  └──────────┬───────────────────────────┘
+             ▼
+   CrossAttention (depth Q, RGB KV)
+   Conv2d + DWConv + Cosine + Temp
+             │
+        (B,N,48)
+             │
+        reshape → (B,48,H/4,W/4)
+             │
+        Conv(48→64,3×3) → GELU
+        Conv(64→64,3×3) → GELU
+        Conv(64→16,3×3)
+        PixelShuffle(×4)    16ch → 1ch
+        Conv(1→1,3×3)
+             │
+        (B,1,H,W)
+             │
+        + lr_depth_hr (bicubic)
+             ▼
+        HR Depth
 ```
 
 ### MambaBlock（SS2D）
 
-- 5 方向扫描：水平、垂直、对角线、水平翻转、垂直翻转
+- 输入/输出: `(B, C, H, W)` 2D 特征图
+- 5 方向扫描：水平（3×1）、垂直（1×3）、对角线（3×3）、水平翻转、垂直翻转
 - 每方向：Depthwise Conv → SiLU 门控
 - 5 方向输出取平均
 - 残差连接 + 可学习缩放因子 α
 
+### 融合交叉注意力
+
+- 深度 Mamba 输出作为 Q，RGB Mamba 输出作为 K/V
+- depth 主动查询 RGB 的结构引导信息
+- 结构与编码器内交叉注意力完全一致
+
 ---
 
-## 五、参数量
+## 五、参数量分布
 
 | 模块 | 参数量 |
 |------|--------|
-| depth_encoder (4 stages) | 0.17M |
-| rgb_encoder (3 stages) | 0.12M |
-| cross_d_blocks (×3) | 0.06M |
-| cross_c_blocks (×2) | 0.04M |
-| MambaDecoder | 0.31M |
-| **Total** | **0.71M** |
+| depth_patch_embed | 816 |
+| rgb_patch_embed | 2,352 |
+| depth_encoder (5 stages × 2 blocks) | 208,514 |
+| rgb_encoder (5 stages × 2 blocks) | 208,514 |
+| cross_d_blocks (×4) | 85,856 |
+| cross_c_blocks (×4) | 85,856 |
+| depth_mamba | 15,360 |
+| rgb_mamba | 15,360 |
+| fusion_cross | 21,464 |
+| upsample | 84,750 |
+| **Total** | **~0.73M** |
 
 ---
 
@@ -212,11 +244,23 @@ Concat(d0,d1,d2,d3)  (B,192,H/4,W/4)
 |------|-----|
 | 超分倍率 | ×8 |
 | 数据集 | NYU Depth v2 (1000 train / 449 test) |
-| HR 裁剪 | 224×224 |
+| HR 裁剪 | 224×224 (LR = 28×28) |
 | Batch size | 16 |
 | 优化器 | AdamW (lr=1e-4, wd=1e-4) |
 | 学习率调度 | StepLR (step=100, gamma=0.5) |
 | 梯度裁剪 | max_norm=1.0 |
 | 混合精度 | AMP (GradScaler) |
-| 损失函数 | L1 + 0.5×GradientLoss |
+| 损失函数 | L1 + 0.5×GradientLoss (Sobel) |
 | 数据增强 | 随机翻转、旋转、裁剪 |
+
+---
+
+## 七、版本演变
+
+| 版本 | 关键变化 | 参数量 |
+|------|---------|--------|
+| v2.0 | Swin+Mamba, PatchMerging, 大维度 | 74.60M |
+| v3.0 | 去 PatchMerging, dim=48, 单 MambaDecoder | 0.71M |
+| v3.1 | CosineAnnealingLR → StepLR | 0.71M |
+| v4.1 | 双分支解码器 + CBAM 融合 + 全局残差 | 0.78M |
+| v4.2 | 双 Mamba + 交叉注意力融合替换 CBAM + 双解码器 | 0.73M |
