@@ -1,23 +1,25 @@
 """
-CDSR-Net v4.2: Color-guided Depth Super-Resolution Network.
-A2GS-style interleaved cross-attention → dual Mamba → cross-attn fusion.
+CDSR-Net v5.0: Color-guided Depth Super-Resolution Network.
+Preprocessing convs + Swin depth encoder + EchoSR CHRG RGB encoder +
+A2GS interleaved cross-attention + dual Mamba + cross-attn fusion.
 
-Architecture (20 SwinBlocks total):
-  depth PatchEmbed ──┐                            RGB PatchEmbed ──┐
-  depth_stage0       │                            rgb_stage0       │
-       d0  ──────────┼─→ cross_d0 ─→ depth_stage1 ─→ d1            │
-                      │       ↑                        │            │
-                      │     g0                          │            │
-                      │       └── cross_c0 ──→ rgb_stage1 ─→ g1    │
-                      │              ...                           │
-                      │       ┌── cross_d3 ─→ depth_stage4 ─→ d4   │
-                      │       │                        │            │
-                      │     g3                          │            │
-                      └───────┼── cross_c3 ──→ rgb_stage4 ─→ g4   │
-                              │                                     │
-                          MambaBlock                         MambaBlock
-                              │                                     │
-                              └──→ CrossAttn(depth Q, RGB KV) ─→ Upsample → HR
+Architecture:
+  depth PreConv ─┐                            RGB PreConv ─┐
+  depth PatchEmbed│                            RGB PatchEmbed│
+  depth_stage0    │                            CHRG_stage0    │
+       d0  ───────┼─→ cross_d0 ─→ depth_stage1 ─→ d1        │
+                  │       ↑                        │         │
+                  │     g0                          │         │
+                  │       └── cross_c0 ──→ CHRG_stage1 ─→ g1 │
+                  │              ...                          │
+                  │       ┌── cross_d3 ─→ depth_stage4 ─→ d4  │
+                  │       │                        │         │
+                  │     g3                          │         │
+                  └───────┼── cross_c3 ──→ CHRG_stage4 ─→ g4 │
+                          │                                     │
+                      MambaBlock                         MambaBlock
+                          │                                     │
+                          └──→ CrossAttn(depth Q, RGB KV) ─→ Upsample → HR
 """
 import torch
 import torch.nn as nn
@@ -26,6 +28,7 @@ import torch.nn.functional as F
 from .swin_encoder import SwinStage, PatchEmbed
 from .fusion import A2GSCrossTransformerBlock
 from .mamba_decoder import MambaBlock
+from .echosr import CHRG
 
 
 class BranchDecoder(nn.Module):
@@ -78,9 +81,9 @@ class CBAM(nn.Module):
 
 
 class CDSRNet(nn.Module):
-    """CDSR-Net v4.2: A2GS interleaved cross-attention + dual Mamba + cross-attn fusion.
+    """CDSR-Net v5.0: Preprocessing convs + Swin depth encoder + EchoSR CHRG RGB encoder.
 
-    5 depth stages + 5 RGB stages (2 SwinBlocks each = 20 total),
+    5 depth SwinStages (2 SwinBlocks each) + 5 RGB CHRGs (5 CHBs each).
     4 cross_d + 4 cross_c blocks in A2GS interleaved order.
     Dual MambaBlocks refine features, then cross-attention (depth Q, RGB KV)
     fuses the two branches before upsampling to HR.
@@ -97,7 +100,9 @@ class CDSRNet(nn.Module):
                  cross_mlp_ratio: float = 2.0,
                  d_state: int = 16,
                  expand: int = 2,
-                 scale: int = 8):
+                 scale: int = 8,
+                 chrg_depths: list = None,
+                 chrg_mlp_ratio: float = 1.5):
         super().__init__()
         if block_depths is None:
             block_depths = [2, 2, 2, 2]
@@ -115,15 +120,24 @@ class CDSRNet(nn.Module):
 
         self.total_stages = len(block_depths)
 
+        # CHRG depths: 5 CHBs per group (EchoSR paper default)
+        if chrg_depths is None:
+            chrg_depths = [5] * self.total_stages  # [5, 5, 5, 5, 5]
+
+        # Preprocessing conv layers (before PatchEmbed)
+        self.depth_pre = nn.Conv2d(1, 1, 3, padding=1)
+        self.rgb_pre = nn.Conv2d(3, 3, 3, padding=1)
+
         # Patch embedding
         self.depth_patch_embed = PatchEmbed(4, 1, embed_dim)
         self.rgb_patch_embed = PatchEmbed(4, 3, embed_dim)
 
-        # Drop path rates: 20 SwinBlocks (5 stages × 2 branches × 2 blocks)
-        total_blocks = sum(block_depths) * 2
-        dpr = [drop_path_rate * i / (total_blocks - 1) for i in range(total_blocks)] if total_blocks > 1 else [0.0] * total_blocks
+        # Drop path rates: 10 depth SwinBlocks (5 stages × 2 blocks)
+        depth_total_blocks = sum(block_depths)
+        dpr = [drop_path_rate * i / max(1, depth_total_blocks - 1)
+               for i in range(depth_total_blocks)]
 
-        # Build depth stages and RGB stages
+        # Build depth stages (Swin) and RGB stages (EchoSR CHRG)
         self.depth_stages = nn.ModuleList()
         self.rgb_stages = nn.ModuleList()
         self.cross_d_blocks = nn.ModuleList()
@@ -131,7 +145,7 @@ class CDSRNet(nn.Module):
 
         idx = 0
         for i in range(self.total_stages):
-            # Depth stage
+            # Depth stage: SwinTransformer
             stage_dpr = dpr[idx:idx + block_depths[i]]
             idx += block_depths[i]
             self.depth_stages.append(
@@ -141,14 +155,10 @@ class CDSRNet(nn.Module):
                           drop_path_rates=stage_dpr)
             )
 
-            # RGB stage
-            stage_dpr = dpr[idx:idx + block_depths[i]]
-            idx += block_depths[i]
+            # RGB stage: EchoSR CHRG (5 CHBs per group, matching EchoSR paper)
             self.rgb_stages.append(
-                SwinStage(dim=embed_dim, depth=block_depths[i],
-                          num_heads=num_heads[i], window_size=window_size,
-                          mlp_ratio=mlp_ratio, do_merge=False,
-                          drop_path_rates=stage_dpr)
+                CHRG(dim=embed_dim, depth=chrg_depths[i],
+                     mlp_ratio=chrg_mlp_ratio, drop_path=drop_path_rate)
             )
 
             # Cross-attention (4 pairs for 5 stages)
@@ -194,21 +204,25 @@ class CDSRNet(nn.Module):
             lr_depth_hr = F.pad(lr_depth_hr, (0, pad_w, 0, pad_h))
             rgb = F.pad(rgb, (0, pad_w, 0, pad_h))
 
+        # Preprocessing conv layers
+        lr_depth_hr = self.depth_pre(lr_depth_hr)
+        rgb = self.rgb_pre(rgb)
+
         # Patch embedding
         x, H, W = self.depth_patch_embed(lr_depth_hr)
         y, _, _ = self.rgb_patch_embed(rgb)
         x_size = (H, W)
 
         # Stage 0: initial transformer (before any cross-attention)
-        x, H, W = self.depth_stages[0](x, H, W)  # d0
-        y, _, _ = self.rgb_stages[0](y, H, W)    # g0
+        x, H, W = self.depth_stages[0](x, H, W)                   # d0
+        y, _, _ = self.rgb_stages[0].forward_seq(y, H, W)         # g0
 
         # 4 groups: cross_d → depth_stage → cross_c → rgb_stage
         for i in range(self.total_stages - 1):
-            x = self.cross_d_blocks[i](x, y, x_size)          # depth Q, RGB KV
-            x, H, W = self.depth_stages[i + 1](x, H, W)       # d_{i+1}
-            y = self.cross_c_blocks[i](y, x, x_size)          # RGB Q, depth KV
-            y, _, _ = self.rgb_stages[i + 1](y, H, W)         # g_{i+1}
+            x = self.cross_d_blocks[i](x, y, x_size)               # depth Q, RGB KV
+            x, H, W = self.depth_stages[i + 1](x, H, W)            # d_{i+1}
+            y = self.cross_c_blocks[i](y, x, x_size)               # RGB Q, depth KV
+            y, _, _ = self.rgb_stages[i + 1].forward_seq(y, H, W)  # g_{i+1}
 
         # Mamba refinement on each branch
         x_2d = x.transpose(1, 2).contiguous().view(B, -1, H, W)
