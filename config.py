@@ -14,9 +14,9 @@ class Config:
 
     # training
     batch_size = 16
-    num_epochs = 200
-    lr = 1e-4
-    lr_step = 100            # StepLR: decay step size (A2GS style)
+    num_epochs = 300
+    lr = 1e-3
+    lr_step = 200            # StepLR: decay step size (A2GS style)
     lr_gamma = 0.5           # StepLR: decay factor per step
     weight_decay = 1e-4
     grad_clip = 1.0          # gradient clipping max norm
