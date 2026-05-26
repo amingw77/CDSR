@@ -6,7 +6,7 @@ class Config:
     _project_root = os.path.dirname(os.path.abspath(__file__))
 
     # dataset (override with --data_root on different machines)
-    data_root = r"D:\PythonProject\datasets\nyu_labeled"
+    data_root = r"/home/hipeson/WorkSpace/DZ/datasets/nyu_labeled"
     scale = 8
     train_split = 1000
     crop_size = 224  # divisible by 28 (LCM of patch_size=4 and window_size=7)
@@ -15,8 +15,8 @@ class Config:
     # training
     batch_size = 16
     num_epochs = 300
-    lr = 1e-3
-    lr_step = 200            # StepLR: decay step size (A2GS style)
+    lr = 1e-4
+    lr_step = 50            # StepLR: decay step size (A2GS style)
     lr_gamma = 0.5           # StepLR: decay factor per step
     weight_decay = 1e-4
     grad_clip = 1.0          # gradient clipping max norm

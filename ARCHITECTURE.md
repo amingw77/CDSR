@@ -19,11 +19,11 @@ Swin Transformer (depth) + EchoSR CHRG (RGB) → A2GS 交错交叉注意力 → 
                     └────┬────┘                        └────┬────┘
                          │                                  │
                     ┌────┴────┐                        ┌────┴────┐
-                    │ PatchEmbed│                       │ PatchEmbed│
+                    │ PatchEmbed│                       │ ConvEmbed │
                     │ 1→48ch    │                       │ 3→48ch    │
                     │ stride=4  │                       │ stride=4  │
                     └────┬────┘                        └────┬────┘
-                         │ (B,N,48) H/4×W/4               │ (B,N,48)
+                         │ (B,N,48) H/4×W/4               │ (B,48,H/4,W/4) 2D
                          │                                  │
      ╔═══════════════════╪══════════════════════════════════╪═══════════╗
      ║ STAGE 0           ▼                                  ▼           ║
@@ -68,7 +68,7 @@ Swin Transformer (depth) + EchoSR CHRG (RGB) → A2GS 交错交叉注意力 → 
                           (重复 3 次，共 4 组)
                                     │
                     ┌───────────────┴───────────────┐
-                    │ d4 (B,N,48)                   │ g4 (B,N,48)
+                    │ d4 (B,N,48)                   │ g4 (B,48,H/4,W/4)
                     │                               │
                     ▼                               ▼
              MambaBlock                       MambaBlock
@@ -95,14 +95,16 @@ Swin Transformer (depth) + EchoSR CHRG (RGB) → A2GS 交错交叉注意力 → 
 
 ---
 
-## 二、预处理卷积层
+## 二、预处理与嵌入层
 
-PatchEmbed 之前，两个分支各加入一个 3×3 卷积进行局部特征预处理：
+两个分支各加入一个 3×3 卷积进行局部特征预处理，之后分别用不同方式嵌入到 48 维。
 
-| 分支 | 卷积 | 输出通道 | 参数量 |
-|------|------|---------|--------|
-| 深度 | Conv2d(1→1, 3×3, pad=1) | 1 | 9 |
-| RGB | Conv2d(3→3, 3×3, pad=1) | 3 | 27 |
+| 分支 | 预处理 | 嵌入（下采样+升维） | 输出格式 |
+|------|--------|-------------------|---------|
+| 深度 | Conv2d(1→1, 3×3, pad=1) | PatchEmbed: Conv2d(1→48, 4, stride=4) → flatten | (B,N,48) 序列 |
+| RGB | Conv2d(3→3, 3×3, pad=1) | Conv2d(3→48, 4, stride=4) | (B,48,H/4,W/4) 2D |
+
+RGB 分支使用普通 stride-4 卷积替代 PatchEmbed，全程保持 2D 格式，CHRG 直接处理 2D 特征，仅在交叉注意力边界临时转为序列。
 
 ---
 
@@ -143,7 +145,7 @@ x → LN → W-MSA/SW-MSA (窗口7×7) → +shortcut → LN → MLP → +shortcu
 
 | 阶段 | CHRG | CHB 数 | COFB | 输出维度 | 输出分辨率 |
 |------|------|--------|------|---------|-----------|
-| PatchEmbed | — | — | — | 48 | H/4 × W/4 |
+| ConvEmbed | — | — | — | 48 | H/4 × W/4 |
 | CHRG 0 | ✓ | 5 | ✓ | 48 | H/4 × W/4 |
 | CHRG 1 | ✓ | 5 | ✓ | 48 | H/4 × W/4 |
 | CHRG 2 | ✓ | 5 | ✓ | 48 | H/4 × W/4 |
@@ -189,24 +191,27 @@ x → 1×1 Conv+GELU → 注意门控[DWConv(k=7)→DWConv(k=15)→1×1 Conv] �
 
 ### 模式
 
+深度分支全程序列格式 `(B,N,48)`，RGB 分支全程 2D 格式 `(B,48,H/4,W/4)`。
+交叉注意力时 RGB 临时 flatten 为序列，交叉完成后转回 2D 供 CHRG 处理。
+
 ```
-d0, g0 (Stage0 输出)
-  → cross_d0: depth(Q) ← RGB(K/V) → d0'
-  → Stage1 depth → d1
-  → cross_c0: RGB(Q) ← depth(K/V) → g0'
-  → CHRG 1 → g1
-  → cross_d1: depth(Q) ← RGB(K/V) → d1'
-  → Stage2 depth → d2
-  → cross_c1: RGB(Q) ← depth(K/V) → g1'
-  → CHRG 2 → g2
-  → cross_d2: depth(Q) ← RGB(K/V) → d2'
-  → Stage3 depth → d3
-  → cross_c2: RGB(Q) ← depth(K/V) → g2'
-  → CHRG 3 → g3
-  → cross_d3: depth(Q) ← RGB(K/V) → d3'
-  → Stage4 depth → d4
-  → cross_c3: RGB(Q) ← depth(K/V) → g3'
-  → CHRG 4 → g4
+d0 (seq), g0 (2D)
+  → g0 flatten → cross_d0: depth(Q) ← RGB(K/V) → d0' (seq)
+  → Stage1 depth → d1 (seq)
+  → g0 flatten → cross_c0: RGB(Q) ← depth(K/V) → g0' (seq) → reshape 2D
+  → CHRG 1 → g1 (2D)
+  → g1 flatten → cross_d1: depth(Q) ← RGB(K/V) → d1' (seq)
+  → Stage2 depth → d2 (seq)
+  → g1 flatten → cross_c1: RGB(Q) ← depth(K/V) → g1' (seq) → reshape 2D
+  → CHRG 2 → g2 (2D)
+  → g2 flatten → cross_d2: depth(Q) ← RGB(K/V) → d2' (seq)
+  → Stage3 depth → d3 (seq)
+  → g2 flatten → cross_c2: RGB(Q) ← depth(K/V) → g2' (seq) → reshape 2D
+  → CHRG 3 → g3 (2D)
+  → g3 flatten → cross_d3: depth(Q) ← RGB(K/V) → d3' (seq)
+  → Stage4 depth → d4 (seq)
+  → g3 flatten → cross_c3: RGB(Q) ← depth(K/V) → g3' (seq) → reshape 2D
+  → CHRG 4 → g4 (2D)
 ```
 
 4 对 cross_d + 4 对 cross_c，交错执行。
@@ -239,9 +244,9 @@ MLP 使用 A2GSMlp：Linear → GELU → DWConv3×3 → GELU → Dropout → Lin
 ### 流程
 
 ```
-d4 (B,N,48)                            g4 (B,N,48)
+d4 (B,N,48)                            g4 (B,48,H/4,W/4) 2D
   │                                      │
-  │ reshape → (B,48,H/4,W/4)             │ reshape → (B,48,H/4,W/4)
+  │ reshape → (B,48,H/4,W/4)             │ (already 2D)
   ▼                                      ▼
 MambaBlock (depth)                   MambaBlock (rgb)
 (5方向SS2D扫描)                      (5方向SS2D扫描)
@@ -291,7 +296,7 @@ MambaBlock (depth)                   MambaBlock (rgb)
 | depth_preconv | 9 |
 | rgb_preconv | 27 |
 | depth_patch_embed | 816 |
-| rgb_patch_embed | 2,352 |
+| rgb_embed | 2,352 |
 | depth_encoder (5 SwinStages × 2 blocks) | 208,514 |
 | rgb_encoder (5 CHRGs × 5 CHBs + 5 COFBs) | ~590,000 |
 | cross_d_blocks (×4) | 85,856 |
@@ -312,8 +317,8 @@ MambaBlock (depth)                   MambaBlock (rgb)
 | 数据集 | NYU Depth v2 (1000 train / 449 test) |
 | HR 裁剪 | 224×224 (LR = 28×28) |
 | Batch size | 16 |
-| 优化器 | AdamW (lr=1e-3, wd=1e-4) |
-| 学习率调度 | StepLR (step=200, gamma=0.5) |
+| 优化器 | Adam (lr=1e-4, no weight_decay) |
+| 学习率调度 | StepLR (step=50, gamma=0.5) |
 | 梯度裁剪 | max_norm=1.0 |
 | 混合精度 | AMP (GradScaler) |
 | 损失函数 | L1 + 0.5×GradientLoss (Sobel) |

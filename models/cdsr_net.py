@@ -5,21 +5,26 @@ A2GS interleaved cross-attention + dual Mamba + cross-attn fusion.
 
 Architecture:
   depth PreConv ─┐                            RGB PreConv ─┐
-  depth PatchEmbed│                            RGB PatchEmbed│
-  depth_stage0    │                            CHRG_stage0    │
-       d0  ───────┼─→ cross_d0 ─→ depth_stage1 ─→ d1        │
-                  │       ↑                        │         │
-                  │     g0                          │         │
-                  │       └── cross_c0 ──→ CHRG_stage1 ─→ g1 │
-                  │              ...                          │
-                  │       ┌── cross_d3 ─→ depth_stage4 ─→ d4  │
-                  │       │                        │         │
-                  │     g3                          │         │
-                  └───────┼── cross_c3 ──→ CHRG_stage4 ─→ g4 │
-                          │                                     │
-                      MambaBlock                         MambaBlock
-                          │                                     │
-                          └──→ CrossAttn(depth Q, RGB KV) ─→ Upsample → HR
+  depth PatchEmbed│                            RGB ConvEmbed │
+  (seq)          │                            (2D)          │
+  depth_stage0   │                            CHRG_stage0    │
+       d0 (seq)  │                              g0 (2D)      │
+       │         │                              │            │
+       │         └─── cross_d0(depth Q, RGB KV)─┘ (flatten)  │
+       ▼                    │                                 │
+  depth_stage1 ─→ d1 (seq)  │                                 │
+                 ┌── cross_c0(RGB Q, depth KV)───► CHRG_stage1│
+                 │                                         g1 (2D)
+                 │              ...                          │
+                 │       ┌── cross_d3 ─→ depth_stage4 ─→ d4  │
+                 │       │                        │         │
+                 │     g3 (2D)                     │         │
+                 └───────┼── cross_c3 ──→ CHRG_stage4 ─→ g4 │
+                         │                      (2D)         │
+                     MambaBlock                         MambaBlock
+                      (seq→2D)                            (2D)
+                         │                                  │
+                         └──→ CrossAttn(depth Q, RGB KV) ─→ Upsample → HR
 """
 import torch
 import torch.nn as nn
@@ -128,9 +133,9 @@ class CDSRNet(nn.Module):
         self.depth_pre = nn.Conv2d(1, 1, 3, padding=1)
         self.rgb_pre = nn.Conv2d(3, 3, 3, padding=1)
 
-        # Patch embedding
+        # Patch embedding (depth) + strided conv embed (RGB, stays 2D for CHRG)
         self.depth_patch_embed = PatchEmbed(4, 1, embed_dim)
-        self.rgb_patch_embed = PatchEmbed(4, 3, embed_dim)
+        self.rgb_embed = nn.Conv2d(3, embed_dim, 4, stride=4)
 
         # Drop path rates: 10 depth SwinBlocks (5 stages × 2 blocks)
         depth_total_blocks = sum(block_depths)
@@ -208,27 +213,32 @@ class CDSRNet(nn.Module):
         lr_depth_hr = self.depth_pre(lr_depth_hr)
         rgb = self.rgb_pre(rgb)
 
-        # Patch embedding
+        # Patch embedding (depth: seq) + conv embed (RGB: 2D)
         x, H, W = self.depth_patch_embed(lr_depth_hr)
-        y, _, _ = self.rgb_patch_embed(rgb)
+        y = self.rgb_embed(rgb)                                    # (B,48,H/4,W/4)
         x_size = (H, W)
 
         # Stage 0: initial transformer (before any cross-attention)
-        x, H, W = self.depth_stages[0](x, H, W)                   # d0
-        y, _, _ = self.rgb_stages[0].forward_seq(y, H, W)         # g0
+        x, H, W = self.depth_stages[0](x, H, W)                   # d0 (seq)
+        y = self.rgb_stages[0](y)                                  # g0 (2D)
 
         # 4 groups: cross_d → depth_stage → cross_c → rgb_stage
         for i in range(self.total_stages - 1):
-            x = self.cross_d_blocks[i](x, y, x_size)               # depth Q, RGB KV
+            # cross_d: depth Q, RGB KV — RGB needs seq
+            y_seq = y.flatten(2).transpose(1, 2)
+            x = self.cross_d_blocks[i](x, y_seq, x_size)
             x, H, W = self.depth_stages[i + 1](x, H, W)            # d_{i+1}
-            y = self.cross_c_blocks[i](y, x, x_size)               # RGB Q, depth KV
-            y, _, _ = self.rgb_stages[i + 1].forward_seq(y, H, W)  # g_{i+1}
 
-        # Mamba refinement on each branch
+            # cross_c: RGB Q, depth KV — RGB in/out seq, convert back to 2D
+            y_seq = y.flatten(2).transpose(1, 2)
+            y_seq = self.cross_c_blocks[i](y_seq, x, x_size)
+            y = y_seq.transpose(1, 2).contiguous().view(B, -1, H, W)
+            y = self.rgb_stages[i + 1](y)                           # g_{i+1} (2D)
+
+        # Mamba refinement on each branch (y is already 2D)
         x_2d = x.transpose(1, 2).contiguous().view(B, -1, H, W)
-        y_2d = y.transpose(1, 2).contiguous().view(B, -1, H, W)
         x_mamba = self.depth_mamba(x_2d)
-        y_mamba = self.rgb_mamba(y_2d)
+        y_mamba = self.rgb_mamba(y)
 
         # Back to sequence format for cross-attention
         x_seq = x_mamba.flatten(2).transpose(1, 2)

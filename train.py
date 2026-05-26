@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.optim import AdamW
+from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
@@ -197,7 +197,7 @@ def main():
     print(f"[Model] Parameters: {n_params / 1e6:.2f}M")
 
     # Optimizer
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=cfg.weight_decay)
+    optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = StepLR(optimizer, step_size=args.lr_step, gamma=args.lr_gamma)
     scaler = GradScaler()
 
