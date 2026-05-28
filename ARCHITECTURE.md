@@ -1,4 +1,4 @@
-# CDSR-Net v5.0: Color-guided Depth Super-Resolution Network
+# CDSR-Net v5.2: Color-guided Depth Super-Resolution Network
 
 Swin Transformer (depth) + EchoSR CHRG (RGB) → A2GS 交错交叉注意力 → 双 Mamba → 交叉注意力融合
 
@@ -315,11 +315,12 @@ MambaBlock (depth)                   MambaBlock (rgb)
 |------|-----|
 | 超分倍率 | ×8 |
 | 数据集 | NYU Depth v2 (1000 train / 449 test) |
+| RGB 输入 | 原始 RGB 图像（3 通道，不做 Sobel 边缘提取） |
 | HR 裁剪 | 224×224 (LR = 28×28) |
-| Batch size | 16 |
+| Batch size | 8 |
 | 优化器 | Adam (lr=1e-4, no weight_decay) |
-| 学习率调度 | StepLR (step=50, gamma=0.5) |
-| 梯度裁剪 | max_norm=1.0 |
+| 学习率调度 | StepLR (step=100, gamma=0.5) |
+| 梯度裁剪 | 禁用 (grad_clip=0) |
 | 混合精度 | AMP (GradScaler) |
 | 损失函数 | L1 + 0.5×GradientLoss (Sobel) |
 | 数据增强 | 随机翻转、旋转、裁剪 |
@@ -336,3 +337,5 @@ MambaBlock (depth)                   MambaBlock (rgb)
 | v4.1 | 双分支解码器 + CBAM 融合 + 全局残差 | 0.78M |
 | v4.2 | 双 Mamba + 交叉注意力融合替换 CBAM + 双解码器 | 0.73M |
 | v5.0 | 预处理卷积 + RGB分支EchoSR CHRG(5×5CHB)替换SwinStage | 1.30M |
+| v5.1 | RGB分支ConvEmbed替代PatchEmbed(全程2D) + AdamW→Adam + lr=1e-4 | 1.30M |
+| v5.2 | 关闭梯度裁剪 + RGB输入改为原始图像(不做Sobel边缘提取) | 1.30M |

@@ -29,7 +29,7 @@ class NYUDepthSR(Dataset):
 
     def __init__(self, root: str, scale: int = 8, train: bool = True,
                  train_split: int = 1000, crop_size: int = 224,
-                 augment: bool = True, pre_extract_edge: bool = True,
+                 augment: bool = True, pre_extract_edge: bool = False,
                  repeat: int = 32):
         """
         Args:
