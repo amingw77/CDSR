@@ -146,6 +146,35 @@ class WindowAttention(nn.Module):
         return x
 
 
+class SwinMlp(nn.Module):
+    """A2GS-style MLP with DWConv for local spatial mixing.
+    fc1 → GELU → DWConv(3×3) → GELU → Drop → fc2 → Drop
+    """
+
+    def __init__(self, dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.fc1 = nn.Linear(dim, hidden)
+        self.act1 = nn.GELU()
+        self.dwconv = nn.Conv2d(hidden, hidden, 3, 1, 1, groups=hidden)
+        self.act2 = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(self, x: torch.Tensor, H: int, W: int):
+        B, N, C = x.shape
+        x = self.fc1(x)
+        x = self.act1(x)
+        x = x.transpose(1, 2).contiguous().view(B, -1, H, W)
+        x = self.dwconv(x)
+        x = x.flatten(2).transpose(1, 2)
+        x = self.act2(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
 class SwinBlock(nn.Module):
     """Swin Transformer block: W-MSA or SW-MSA + MLP, with DropPath."""
 
@@ -161,13 +190,7 @@ class SwinBlock(nn.Module):
         self.attn = WindowAttention(dim, num_heads, window_size, dropout)
 
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, int(dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(dim * mlp_ratio), dim),
-            nn.Dropout(dropout),
-        )
+        self.mlp = SwinMlp(dim, mlp_ratio, dropout)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
@@ -218,8 +241,8 @@ class SwinBlock(nn.Module):
         x = x.reshape(B, H * W, C)
         x = shortcut + self.drop_path(x)
 
-        # MLP with DropPath
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        # MLP with DWConv and DropPath
+        x = x + self.drop_path(self.mlp(self.norm2(x), H, W))
         return x
 
 

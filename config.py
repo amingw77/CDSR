@@ -9,7 +9,7 @@ class Config:
     data_root = r"/home/hipeson/WorkSpace/DZ/datasets/nyu_labeled"
     scale = 8
     train_split = 1000
-    crop_size = 224  # divisible by 28 (LCM of patch_size=4 and window_size=7)
+    crop_size = 256  # divisible by 8 (LCM of patch_size=4 and window_size=8)
     repeat = 10       # each image sampled repeat times per epoch (A2GS style)
 
     # training
@@ -27,7 +27,7 @@ class Config:
     swin_embed_dim = 48
     swin_depths = [2, 2, 2, 2]       # num blocks per stage (A2GS style)
     swin_num_heads = [3, 6, 12, 24]   # heads per stage
-    swin_window_size = 7
+    swin_window_size = 8
     swin_mlp_ratio = 2.0
     swin_drop_path_rate = 0.1         # stochastic depth
 
@@ -43,7 +43,7 @@ class Config:
     loss_edge_weight = 0.5
 
     # version tag (saved in checkpoints, printed in logs)
-    model_version = "5.2"
+    model_version = "5.3"
 
     # checkpoint (portable: relative to project root)
     checkpoint_dir = os.path.join(_project_root, "checkpoints")

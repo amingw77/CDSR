@@ -25,7 +25,8 @@ from utils.metrics import compute_rmse, compute_mae, compute_rel, compute_delta
 
 @torch.no_grad()
 def evaluate(model, loader, dataset, device, results_dir: str = None):
-    model.eval()
+    if model is not None:
+        model.eval()
     metrics = {"rmse": [], "mae": [], "rel": [], "delta1": []}
 
     if results_dir:
@@ -43,8 +44,12 @@ def evaluate(model, loader, dataset, device, results_dir: str = None):
         rgb = rgb.to(device)
         hr_depth = hr_depth.to(device)
 
-        with autocast():
-            pred = model(lr_depth, rgb)
+        if model is not None:
+            with autocast():
+                pred = model(lr_depth, rgb)
+        else:
+            pred = F.interpolate(lr_depth, size=hr_depth.shape[2:],
+                                 mode="bilinear", align_corners=False)
 
         if pred.shape != hr_depth.shape:
             pred = F.interpolate(pred, size=hr_depth.shape[2:],
@@ -106,7 +111,10 @@ def evaluate(model, loader, dataset, device, results_dir: str = None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, default=cfg.data_root)
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="checkpoint path (not needed for --baseline)")
+    parser.add_argument("--baseline", action="store_true",
+                        help="run bicubic upsampling baseline (no model)")
     parser.add_argument("--scale", type=int, default=cfg.scale)
     parser.add_argument("--results_dir", type=str, default=None,
                         help="directory to save visual results (default: checkpoints/results)")
@@ -126,16 +134,24 @@ def main():
                         num_workers=cfg.num_workers, pin_memory=True)
     print(f"[Data] {len(dataset)} test samples")
 
-    # Model
-    model = build_cdsr_net(scale=args.scale)
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model"])
-    model = model.to(device)
-    print(f"[Model] Loaded from {args.checkpoint} (epoch {ckpt['epoch'] + 1})")
+    # Model or baseline
+    if args.baseline:
+        print("[Mode] Bicubic baseline (no model)")
+        model = None
+    else:
+        if args.checkpoint is None:
+            print("[Error] --checkpoint is required (or use --baseline)")
+            sys.exit(1)
+        model = build_cdsr_net(scale=args.scale)
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        model = model.to(device)
+        print(f"[Model] Loaded from {args.checkpoint} (epoch {ckpt['epoch'] + 1})")
 
     # Evaluate
     results_dir = None if args.no_save else (
-        args.results_dir or os.path.join(os.path.dirname(args.checkpoint), "results")
+        args.results_dir or os.path.join(os.path.dirname(args.checkpoint or ""), "results")
+        if args.checkpoint else "results_baseline"
     )
     results = evaluate(model, loader, dataset, device, results_dir)
 

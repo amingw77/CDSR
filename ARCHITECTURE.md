@@ -1,4 +1,4 @@
-# CDSR-Net v5.2: Color-guided Depth Super-Resolution Network
+# CDSR-Net v5.3: Color-guided Depth Super-Resolution Network
 
 Swin Transformer (depth) + EchoSR CHRG (RGB) → A2GS 交错交叉注意力 → 双 Mamba → 交叉注意力融合
 
@@ -7,7 +7,7 @@ Swin Transformer (depth) + EchoSR CHRG (RGB) → A2GS 交错交叉注意力 → 
 ## 一、网络架构总览
 
 ```
-                    LR Depth (B,1,28,28)               RGB (B,3,H,W)
+                    LR Depth (B,1,32,32)               RGB (B,3,H,W)
                          │                                  │
                          │ Bicubic Upsample                 │
                          ▼                                  │
@@ -115,20 +115,24 @@ RGB 分支使用普通 stride-4 卷积替代 PatchEmbed，全程保持 2D 格式
 | 阶段 | SwinBlock 数 | 注意力头数 | 窗口 | 输出维度 | 输出分辨率 |
 |------|-------------|-----------|------|---------|-----------|
 | PatchEmbed | — | — | — | 48 | H/4 × W/4 |
-| Stage 0 | 2 | 3 | 7 | 48 | H/4 × W/4 |
-| Stage 1 | 2 | 6 | 7 | 48 | H/4 × W/4 |
-| Stage 2 | 2 | 12 | 7 | 48 | H/4 × W/4 |
-| Stage 3 | 2 | 24 | 7 | 48 | H/4 × W/4 |
-| Stage 4 | 2 | 24 | 7 | 48 | H/4 × W/4 |
+| Stage 0 | 2 | 3 | 8 | 48 | H/4 × W/4 |
+| Stage 1 | 2 | 6 | 8 | 48 | H/4 × W/4 |
+| Stage 2 | 2 | 12 | 8 | 48 | H/4 × W/4 |
+| Stage 3 | 2 | 24 | 8 | 48 | H/4 × W/4 |
+| Stage 4 | 2 | 24 | 8 | 48 | H/4 × W/4 |
 
 5 个 stage，共 10 个 SwinBlock。所有 stage 无 PatchMerging，同分辨率同维度。
 
 ### SwinBlock 内部
 
+MLP 使用 A2GS 风格，加入 DWConv 增强局部空间建模（v5.3）：
+
 ```
-x → LN → W-MSA/SW-MSA (窗口7×7) → +shortcut → LN → MLP → +shortcut → out
+x → LN → W-MSA/SW-MSA (窗口8×8) → +shortcut → LN → MLP → +shortcut → out
                                                     │
                                                     ├─ Linear(dim → dim×mlp_ratio)
+                                                    ├─ GELU
+                                                    ├─ DWConv(3×3, groups=hidden)
                                                     ├─ GELU
                                                     ├─ Dropout
                                                     ├─ Linear(dim×mlp_ratio → dim)
@@ -297,7 +301,7 @@ MambaBlock (depth)                   MambaBlock (rgb)
 | rgb_preconv | 27 |
 | depth_patch_embed | 816 |
 | rgb_embed | 2,352 |
-| depth_encoder (5 SwinStages × 2 blocks) | 208,514 |
+| depth_encoder (5 SwinStages × 2 blocks, w/ DWConv MLP) | 218,114 |
 | rgb_encoder (5 CHRGs × 5 CHBs + 5 COFBs) | ~590,000 |
 | cross_d_blocks (×4) | 85,856 |
 | cross_c_blocks (×4) | 85,856 |
@@ -305,7 +309,7 @@ MambaBlock (depth)                   MambaBlock (rgb)
 | rgb_mamba | 15,360 |
 | fusion_cross | 21,464 |
 | upsample | 84,750 |
-| **Total** | **~1.30M** |
+| **Total** | **~1.31M** |
 
 ---
 
@@ -316,13 +320,13 @@ MambaBlock (depth)                   MambaBlock (rgb)
 | 超分倍率 | ×8 |
 | 数据集 | NYU Depth v2 (1000 train / 449 test) |
 | RGB 输入 | 原始 RGB 图像（3 通道，不做 Sobel 边缘提取） |
-| HR 裁剪 | 224×224 (LR = 28×28) |
+| HR 裁剪 | 256×256 (LR = 32×32) |
 | Batch size | 8 |
-| 优化器 | Adam (lr=1e-4, no weight_decay) |
-| 学习率调度 | StepLR (step=100, gamma=0.5) |
+| 优化器 | Adam (lr=5e-4, no weight_decay) |
+| 学习率调度 | StepLR (step=150, gamma=0.5) |
 | 梯度裁剪 | 禁用 (grad_clip=0) |
 | 混合精度 | AMP (GradScaler) |
-| 损失函数 | L1 + 0.5×GradientLoss (Sobel) |
+| 损失函数 | L1（EdgeLoss 权重暂设为 0） |
 | 数据增强 | 随机翻转、旋转、裁剪 |
 
 ---
@@ -339,3 +343,4 @@ MambaBlock (depth)                   MambaBlock (rgb)
 | v5.0 | 预处理卷积 + RGB分支EchoSR CHRG(5×5CHB)替换SwinStage | 1.30M |
 | v5.1 | RGB分支ConvEmbed替代PatchEmbed(全程2D) + AdamW→Adam + lr=1e-4 | 1.30M |
 | v5.2 | 关闭梯度裁剪 + RGB输入改为原始图像(不做Sobel边缘提取) | 1.30M |
+| v5.3 | Swin MLP加入DWConv + crop=256 + window=8 + lr=5e-4 + step=150 | 1.31M |
