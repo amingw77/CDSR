@@ -24,9 +24,9 @@ class Config:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Swin encoder
-    swin_embed_dim = 48
+    swin_embed_dim = 64
     swin_depths = [2, 2, 2, 2]       # num blocks per stage (A2GS style)
-    swin_num_heads = [3, 6, 12, 24]   # heads per stage
+    swin_num_heads = [2, 2, 2, 2]     # heads per stage (A2GS style, all=2)
     swin_window_size = 8
     swin_mlp_ratio = 2.0
     swin_drop_path_rate = 0.1         # stochastic depth
@@ -43,7 +43,7 @@ class Config:
     loss_edge_weight = 0.5
 
     # version tag (saved in checkpoints, printed in logs)
-    model_version = "5.3"
+    model_version = "5.5"
 
     # checkpoint (portable: relative to project root)
     checkpoint_dir = os.path.join(_project_root, "checkpoints")

@@ -49,7 +49,7 @@ def evaluate(model, loader, dataset, device, results_dir: str = None):
                 pred = model(lr_depth, rgb)
         else:
             pred = F.interpolate(lr_depth, size=hr_depth.shape[2:],
-                                 mode="bilinear", align_corners=False)
+                                 mode="bicubic", align_corners=False)
 
         if pred.shape != hr_depth.shape:
             pred = F.interpolate(pred, size=hr_depth.shape[2:],
@@ -128,7 +128,7 @@ def main():
     # Data
     dataset = NYUDepthSR(
         root=args.data_root, scale=args.scale, train=False,
-        crop_size=0, augment=False, pre_extract_edge=True
+        crop_size=0, augment=False, pre_extract_edge=False
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False,
                         num_workers=cfg.num_workers, pin_memory=True)
@@ -142,7 +142,18 @@ def main():
         if args.checkpoint is None:
             print("[Error] --checkpoint is required (or use --baseline)")
             sys.exit(1)
-        model = build_cdsr_net(scale=args.scale)
+        model = build_cdsr_net(
+            scale=args.scale,
+            embed_dim=cfg.swin_embed_dim,
+            block_depths=cfg.swin_depths,
+            num_heads=cfg.swin_num_heads,
+            window_size=cfg.swin_window_size,
+            mlp_ratio=cfg.swin_mlp_ratio,
+            drop_path_rate=cfg.swin_drop_path_rate,
+            fusion_num_heads=cfg.fusion_num_heads,
+            d_state=cfg.mamba_d_state,
+            expand=cfg.mamba_expand,
+        )
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model"])
         model = model.to(device)

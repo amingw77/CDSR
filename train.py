@@ -167,12 +167,12 @@ def main():
     try:
         train_dataset = NYUDepthSR(
             root=args.data_root, scale=args.scale, train=True,
-            crop_size=args.crop_size, augment=True, pre_extract_edge=True,
+            crop_size=args.crop_size, augment=True, pre_extract_edge=False,
             repeat=cfg.repeat
         )
         test_dataset = NYUDepthSR(
             root=args.data_root, scale=args.scale, train=False,
-            crop_size=0, augment=False, pre_extract_edge=True
+            crop_size=0, augment=False, pre_extract_edge=False
         )
     except Exception as e:
         print(f"[ERROR] Dataset loading failed: {e}")
@@ -192,7 +192,18 @@ def main():
 
     # Model
     print("[Model] Building...")
-    model = build_cdsr_net(scale=args.scale)
+    model = build_cdsr_net(
+        scale=args.scale,
+        embed_dim=cfg.swin_embed_dim,
+        block_depths=cfg.swin_depths,
+        num_heads=cfg.swin_num_heads,
+        window_size=cfg.swin_window_size,
+        mlp_ratio=cfg.swin_mlp_ratio,
+        drop_path_rate=cfg.swin_drop_path_rate,
+        fusion_num_heads=cfg.fusion_num_heads,
+        d_state=cfg.mamba_d_state,
+        expand=cfg.mamba_expand,
+    )
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[Model] Parameters: {n_params / 1e6:.2f}M")
