@@ -10,7 +10,7 @@ class Config:
     scale = 8
     train_split = 1000
     crop_size = 256  # divisible by 8 (LCM of patch_size=4 and window_size=8)
-    repeat = 20       # each image sampled repeat times per epoch (A2GS style)
+    repeat = 32       # each image sampled repeat times per epoch (A2GS style)
 
     # training
     batch_size = 8
