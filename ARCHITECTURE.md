@@ -1,13 +1,17 @@
-# CDSR-Net v5.5: Color-Guided Depth Super-Resolution
+# CDSR-Net v5.6: Color-Guided Depth Super-Resolution
 
 CDSR-Net is designed for 8x color-guided depth super-resolution. The model takes a low-resolution depth map and the corresponding high-resolution RGB image as input, and predicts a high-resolution depth map.
 
-Version 5.5 updates the data pipeline to use raw RGB guidance and bicubic depth degradation:
+Version 5.6 keeps the raw RGB and bicubic degradation pipeline from v5.5, and updates training stability and residual handling:
 
 - RGB branch input: raw RGB image, normalized to `[0, 1]`.
 - LR depth generation: bicubic downsampling from normalized HR depth.
 - Training crop: `256 x 256` remains compatible with 8x SR, producing `32 x 32` LR depth.
 - The old Sobel-edge guide path is kept in the dataset for ablation only, but training and testing now use `pre_extract_edge=False`.
+- The global residual now uses the raw bicubic-upsampled LR depth, not the feature after `depth_pre`.
+- Training uses AdamW with configured weight decay.
+- Training and validation skip non-finite predictions/losses instead of letting one bad batch poison the epoch metrics.
+- Validation runs every 5 epochs through epoch 150, then every 10 epochs.
 
 ---
 
@@ -68,7 +72,7 @@ LR depth: (1, 32, 32)
 
 ### 2.3 RGB Guidance
 
-In v5.5, the model uses raw RGB guidance:
+In v5.6, the model uses raw RGB guidance:
 
 ```python
 rgb_input = np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))
@@ -204,10 +208,15 @@ PixelShuffle(4)
 Conv2d(1 -> 1)
 ```
 
-A global residual connection adds the bicubic-upsampled LR depth:
+A global residual connection adds the raw bicubic-upsampled LR depth. This tensor is preserved separately before `depth_pre`, so the residual path remains a clean depth baseline:
 
 ```python
-out = out + lr_depth_hr
+lr_depth_hr = F.interpolate(lr_depth, size=(H_hr, W_hr), mode="bicubic", align_corners=False)
+lr_depth_res = lr_depth_hr
+...
+lr_depth_hr = self.depth_pre(lr_depth_hr)
+...
+out = out + lr_depth_res
 ```
 
 ---
@@ -218,32 +227,34 @@ Defined in `config.py`.
 
 | Item | Value |
 |---|---:|
-| Version | 5.5 |
+| Version | 5.6 |
 | Scale | 8 |
 | Train split | 1000 |
 | Test split | Remaining samples |
 | Crop size | 256 |
-| Repeat | 10 |
+| Repeat | 20 |
 | Batch size | 8 |
 | Epochs | 300 |
 | Learning rate | 5e-4 |
 | LR scheduler | StepLR |
-| LR step | 150 |
+| LR step | 100 |
 | LR gamma | 0.5 |
-| Weight decay config | 1e-4 |
+| Optimizer | AdamW |
+| Weight decay | 1e-4 |
 | Gradient clipping | Disabled |
-| Loss | L1 + 0.5 * gradient loss |
+| Loss | L1 + 0.1 * gradient loss |
 | AMP | Enabled |
 | RGB input | Raw RGB |
 | LR degradation | Bicubic downsampling |
+| Validation interval | Every 5 epochs through epoch 150, then every 10 epochs |
 
-Note: `weight_decay` is defined in the config, but the current optimizer call still uses plain Adam without passing `weight_decay`.
+When resuming from an older checkpoint, the optimizer parameter groups are re-synchronized to the current `lr` and `weight_decay`.
 
 ---
 
 ## 6. Parameter Count
 
-Measured with the current v5.5 configuration:
+Measured with the current v5.6 configuration:
 
 ```text
 Total trainable parameters: 2,064,303
@@ -300,6 +311,12 @@ Evaluation metrics:
 
 Metrics are computed on de-normalized depth values, with 6-pixel border clipping during evaluation.
 
+Training stability guards:
+
+- If a training batch produces a non-finite prediction or loss, that batch is skipped and a warning is logged.
+- If a validation batch produces non-finite predictions, that batch is skipped and a warning is logged.
+- If every batch in an epoch or validation pass is skipped, training raises an error instead of reporting invalid metrics.
+
 ---
 
 ## 8. Redundant or Legacy Components
@@ -319,13 +336,13 @@ They are not used by the current `CDSRNet` forward path. If the project is prepa
 
 ## 9. Recommended Ablations
 
-To validate whether the v5.5 structure is necessary, run:
+To validate whether the v5.6 structure is necessary, run:
 
 1. Raw RGB vs Sobel edge guidance.
 2. CHRG depth `[5,5,5,5,5]` vs lighter `[3,3,3,3,3]` or `[2,2,2,2,2]`.
 3. With and without `cross_c_blocks`.
-4. Edge loss weights: `0`, `0.1`, `0.5`.
-5. Adam vs AdamW with configured weight decay.
+4. Edge loss weights: `0`, `0.05`, `0.1`, `0.2`.
+5. AdamW weight decay: `0`, `1e-5`, `1e-4`.
 
 These ablations are important because the current RGB branch is expressive, but relatively heavy compared with the rest of the network.
 
@@ -344,3 +361,4 @@ These ablations are important because the current RGB branch is expressive, but 
 | v5.3 | Added DWConv inside Swin MLP, changed crop to 256 and window to 8. |
 | v5.4 | Increased embed dimension to 64, unified heads to 2, and updated training/test config. |
 | v5.5 | Switched default guidance to raw RGB, changed LR depth degradation to bicubic, and fixed crop alignment for 8x SR. |
+| v5.6 | Fixed the global residual to use raw bicubic depth, switched training to AdamW, added non-finite guards, changed validation cadence, and updated current training hyperparameters. |

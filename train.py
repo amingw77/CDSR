@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
@@ -48,21 +48,30 @@ def train_epoch(model, loader, optimizer, scaler, device, epoch, total_epochs):
     total_l1 = 0.0
     total_edge = 0.0
     count = 0
+    skipped = 0
 
     pbar = tqdm(loader, desc=f"Train E{epoch:3d}/{total_epochs}",
                 bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
-    for lr_depth, rgb, hr_depth, dmin, dmax in pbar:
+    for batch_idx, (lr_depth, rgb, hr_depth, dmin, dmax) in enumerate(pbar):
         lr_depth = lr_depth.to(device)
         rgb = rgb.to(device)
         hr_depth = hr_depth.to(device)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         with autocast():
             pred = model(lr_depth, rgb)
+            if not torch.isfinite(pred).all():
+                skipped += 1
+                print(f"[WARN] Non-finite prediction at epoch {epoch}, batch {batch_idx}; skipping batch")
+                continue
             l1_loss = F.l1_loss(pred, hr_depth)
             edge_loss = compute_gradient_loss(pred, hr_depth)
             loss = cfg.loss_l1_weight * l1_loss + cfg.loss_edge_weight * edge_loss
+            if not torch.isfinite(loss):
+                skipped += 1
+                print(f"[WARN] Non-finite loss at epoch {epoch}, batch {batch_idx}; skipping batch")
+                continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -77,6 +86,11 @@ def train_epoch(model, loader, optimizer, scaler, device, epoch, total_epochs):
 
         pbar.set_postfix({"L1": f"{total_l1/count:.4f}", "Edge": f"{total_edge/count:.4f}"})
 
+    if skipped > 0:
+        print(f"[WARN] Skipped {skipped} non-finite training batches in epoch {epoch}")
+    if count == 0:
+        raise RuntimeError(f"All training batches were skipped in epoch {epoch}")
+
     return total_l1 / count, total_edge / count
 
 
@@ -85,14 +99,19 @@ def validate(model, loader, device):
     model.eval()
     metrics = {"rmse": 0.0, "mae": 0.0, "rel": 0.0, "delta1": 0.0}
     count = 0
+    skipped = 0
 
     pbar = tqdm(loader, desc="Validate", bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}]")
-    for lr_depth, rgb, hr_depth, dmin, dmax in pbar:
+    for batch_idx, (lr_depth, rgb, hr_depth, dmin, dmax) in enumerate(pbar):
         lr_depth = lr_depth.to(device)
         rgb = rgb.to(device)
         hr_depth = hr_depth.to(device)
 
         pred = model(lr_depth, rgb)
+        if not torch.isfinite(pred).all():
+            skipped += pred.size(0)
+            print(f"[WARN] Non-finite prediction during validation at batch {batch_idx}; skipping batch")
+            continue
 
         # Align sizes (in case of edge effects)
         if pred.shape != hr_depth.shape:
@@ -109,6 +128,11 @@ def validate(model, loader, device):
             metrics["rel"] += compute_rel(p, t, dm, dx, eval_mode=True)
             metrics["delta1"] += compute_delta(p, t, dm, dx, eval_mode=True)
             count += 1
+
+    if skipped > 0:
+        print(f"[WARN] Skipped {skipped} validation samples with non-finite predictions")
+    if count == 0:
+        raise RuntimeError("All validation samples were skipped")
 
     for k in metrics:
         metrics[k] /= count
@@ -209,7 +233,7 @@ def main():
     print(f"[Model] Parameters: {n_params / 1e6:.2f}M")
 
     # Optimizer
-    optimizer = Adam(model.parameters(), lr=args.lr)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=cfg.weight_decay)
     scheduler = StepLR(optimizer, step_size=args.lr_step, gamma=args.lr_gamma)
     scaler = GradScaler()
 
@@ -222,6 +246,9 @@ def main():
         print(f"[Resume] Checkpoint version: v{ckpt_version}")
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
+            group["weight_decay"] = cfg.weight_decay
         scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt["epoch"] + 1
         best_rmse = ckpt.get("best_rmse", float("inf"))
@@ -238,10 +265,12 @@ def main():
                 epoch, model, optimizer, scheduler, best_rmse
             )
 
-            if (epoch + 1) % 10 == 0 or epoch == 0:
+            current_epoch = epoch + 1
+            val_interval = 5 if current_epoch <= 150 else 10
+            if current_epoch % val_interval == 0 or epoch == 0:
                 val_metrics = validate(model, test_loader, device)
                 rmse = val_metrics["rmse"]
-                print(f"[Epoch {epoch + 1:3d}] L1: {l1_loss:.4f}  Edge: {edge_loss:.4f}  "
+                print(f"[Epoch {current_epoch:3d}] L1: {l1_loss:.4f}  Edge: {edge_loss:.4f}  "
                       f"RMSE: {rmse:.4f}  MAE: {val_metrics['mae']:.4f}  "
                       f"Rel: {val_metrics['rel']:.4f}  δ1: {val_metrics['delta1']:.1f}%")
 

@@ -10,13 +10,13 @@ class Config:
     scale = 8
     train_split = 1000
     crop_size = 256  # divisible by 8 (LCM of patch_size=4 and window_size=8)
-    repeat = 10       # each image sampled repeat times per epoch (A2GS style)
+    repeat = 20       # each image sampled repeat times per epoch (A2GS style)
 
     # training
     batch_size = 8
     num_epochs = 300
     lr = 5e-4
-    lr_step = 150            # StepLR: decay step size (A2GS style)
+    lr_step = 100            # StepLR: decay step size (A2GS style)
     lr_gamma = 0.5           # StepLR: decay factor per step
     weight_decay = 1e-4
     grad_clip = 0             # gradient clipping max norm (0 = disabled)
@@ -40,10 +40,10 @@ class Config:
 
     # loss weights
     loss_l1_weight = 1.0
-    loss_edge_weight = 0.5
+    loss_edge_weight = 0.1
 
     # version tag (saved in checkpoints, printed in logs)
-    model_version = "5.5"
+    model_version = "5.6"
 
     # checkpoint (portable: relative to project root)
     checkpoint_dir = os.path.join(_project_root, "checkpoints")

@@ -202,11 +202,13 @@ class CDSRNet(nn.Module):
 
         lr_depth_hr = F.interpolate(lr_depth, size=(H_hr, W_hr),
                                      mode="bicubic", align_corners=False)
+        lr_depth_res = lr_depth_hr
 
         pad_h = (self.patch_size - H_hr % self.patch_size) % self.patch_size
         pad_w = (self.patch_size - W_hr % self.patch_size) % self.patch_size
         if pad_h > 0 or pad_w > 0:
             lr_depth_hr = F.pad(lr_depth_hr, (0, pad_w, 0, pad_h))
+            lr_depth_res = F.pad(lr_depth_res, (0, pad_w, 0, pad_h))
             rgb = F.pad(rgb, (0, pad_w, 0, pad_h))
 
         # Preprocessing conv layers
@@ -251,8 +253,8 @@ class CDSRNet(nn.Module):
         fused_2d = fused.transpose(1, 2).contiguous().view(B, -1, H, W)
         out = self.upsample(fused_2d)
 
-        # Global residual: bicubic upsampled LR depth
-        out = out + lr_depth_hr
+        # Global residual uses the raw bicubic-upsampled LR depth.
+        out = out + lr_depth_res
         return out
 
 
