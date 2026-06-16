@@ -9,7 +9,6 @@ import argparse
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -45,8 +44,7 @@ def evaluate(model, loader, dataset, device, results_dir: str = None):
         hr_depth = hr_depth.to(device)
 
         if model is not None:
-            with autocast():
-                pred = model(lr_depth, rgb)
+            pred = model(lr_depth, rgb)
         else:
             pred = F.interpolate(lr_depth, size=hr_depth.shape[2:],
                                  mode="bicubic", align_corners=False)

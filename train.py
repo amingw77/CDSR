@@ -13,8 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import StepLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -43,7 +42,7 @@ class TeeLogger:
         self.log.close()
 
 
-def train_epoch(model, loader, optimizer, scaler, device, epoch, total_epochs):
+def train_epoch(model, loader, optimizer, device, epoch, total_epochs):
     model.train()
     total_l1 = 0.0
     total_edge = 0.0
@@ -59,26 +58,34 @@ def train_epoch(model, loader, optimizer, scaler, device, epoch, total_epochs):
 
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast():
-            pred = model(lr_depth, rgb)
-            if not torch.isfinite(pred).all():
-                skipped += 1
-                print(f"[WARN] Non-finite prediction at epoch {epoch}, batch {batch_idx}; skipping batch")
-                continue
-            l1_loss = F.l1_loss(pred, hr_depth)
-            edge_loss = compute_gradient_loss(pred, hr_depth)
-            loss = cfg.loss_l1_weight * l1_loss + cfg.loss_edge_weight * edge_loss
-            if not torch.isfinite(loss):
-                skipped += 1
-                print(f"[WARN] Non-finite loss at epoch {epoch}, batch {batch_idx}; skipping batch")
-                continue
+        pred = model(lr_depth, rgb)
+        if not torch.isfinite(pred).all():
+            skipped += 1
+            print(f"[WARN] Non-finite prediction at epoch {epoch}, batch {batch_idx}; skipping batch")
+            continue
+        l1_loss = F.l1_loss(pred, hr_depth)
+        edge_loss = compute_gradient_loss(pred, hr_depth)
+        loss = cfg.loss_l1_weight * l1_loss + cfg.loss_edge_weight * edge_loss
+        if not torch.isfinite(loss):
+            skipped += 1
+            print(f"[WARN] Non-finite loss at epoch {epoch}, batch {batch_idx}; skipping batch")
+            continue
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        loss.backward()
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+
+        has_nan_grad = False
+        for p in model.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                has_nan_grad = True
+                break
+        if has_nan_grad:
+            skipped += 1
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        optimizer.step()
 
         total_l1 += l1_loss.item() * lr_depth.size(0)
         total_edge += edge_loss.item() * lr_depth.size(0)
@@ -157,7 +164,6 @@ def main():
     parser.add_argument("--batch_size", type=int, default=cfg.batch_size)
     parser.add_argument("--epochs", type=int, default=cfg.num_epochs)
     parser.add_argument("--lr", type=float, default=cfg.lr)
-    parser.add_argument("--lr_step", type=int, default=cfg.lr_step)
     parser.add_argument("--lr_gamma", type=float, default=cfg.lr_gamma)
     parser.add_argument("--scale", type=int, default=cfg.scale)
     parser.add_argument("--crop_size", type=int, default=cfg.crop_size)
@@ -234,8 +240,8 @@ def main():
 
     # Optimizer
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=cfg.weight_decay)
-    scheduler = StepLR(optimizer, step_size=args.lr_step, gamma=args.lr_gamma)
-    scaler = GradScaler()
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=cfg.lr_gamma,
+                                   patience=cfg.lr_patience, min_lr=1e-6)
 
     start_epoch = 0
     best_rmse = float("inf")
@@ -249,15 +255,18 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = args.lr
             group["weight_decay"] = cfg.weight_decay
-        scheduler.load_state_dict(ckpt["scheduler"])
+        try:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        except (KeyError, ValueError, TypeError):
+            print("[Resume] Could not load scheduler state (type mismatch); using fresh scheduler")
         start_epoch = ckpt["epoch"] + 1
         best_rmse = ckpt.get("best_rmse", float("inf"))
         print(f"[Resume] Start epoch {start_epoch}, Best RMSE: {best_rmse:.4f}")
 
     try:
         for epoch in range(start_epoch, args.epochs):
-            l1_loss, edge_loss = train_epoch(model, train_loader, optimizer, scaler, device, epoch + 1, args.epochs)
-            scheduler.step()
+            l1_loss, edge_loss = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.epochs)
+            scheduler.step(l1_loss)
 
             # Save last checkpoint every epoch (always resumable)
             save_checkpoint(

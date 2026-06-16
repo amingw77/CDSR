@@ -16,8 +16,8 @@ class Config:
     batch_size = 8
     num_epochs = 300
     lr = 5e-4
-    lr_step = 100            # StepLR: decay step size (A2GS style)
-    lr_gamma = 0.5           # StepLR: decay factor per step
+    lr_gamma = 0.5           # ReduceLROnPlateau: decay factor
+    lr_patience = 10          # ReduceLROnPlateau: patience epochs
     weight_decay = 1e-4
     grad_clip = 0             # gradient clipping max norm (0 = disabled)
     num_workers = 2
