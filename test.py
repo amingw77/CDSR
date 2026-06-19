@@ -149,8 +149,6 @@ def main():
             mlp_ratio=cfg.swin_mlp_ratio,
             drop_path_rate=cfg.swin_drop_path_rate,
             fusion_num_heads=cfg.fusion_num_heads,
-            d_state=cfg.mamba_d_state,
-            expand=cfg.mamba_expand,
         )
         ckpt = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(ckpt["model"])

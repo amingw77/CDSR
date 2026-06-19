@@ -1,17 +1,17 @@
-# CDSR-Net v5.6: Color-Guided Depth Super-Resolution
+# CDSR-Net v5.7: Color-Guided Depth Super-Resolution
 
 CDSR-Net is designed for 8x color-guided depth super-resolution. The model takes a low-resolution depth map and the corresponding high-resolution RGB image as input, and predicts a high-resolution depth map.
 
-Version 5.6 keeps the raw RGB and bicubic degradation pipeline from v5.5, and updates training stability and residual handling:
+Version 5.7 removes the dual MambaBlocks from the decoder (v5.7) and updates training:
 
+- Encoder outputs fused directly via cross-attention, then upsampled to HR. No Mamba refinement.
 - RGB branch input: raw RGB image, normalized to `[0, 1]`.
 - LR depth generation: bicubic downsampling from normalized HR depth.
-- Training crop: `256 x 256` remains compatible with 8x SR, producing `32 x 32` LR depth.
-- The old Sobel-edge guide path is kept in the dataset for ablation only, but training and testing now use `pre_extract_edge=False`.
-- The global residual now uses the raw bicubic-upsampled LR depth, not the feature after `depth_pre`.
-- Training uses AdamW with configured weight decay.
-- Training and validation skip non-finite predictions/losses instead of letting one bad batch poison the epoch metrics.
-- Validation runs every 5 epochs through epoch 150, then every 10 epochs.
+- Training crop: `256 x 256`, producing `32 x 32` LR depth.
+- Optimizer: Adam (weight_decay=0).
+- LR scheduler: ReduceLROnPlateau (patience=10, factor=0.5, min_lr=1e-6).
+- AMP disabled (pure FP32).
+- Three-layer NaN guard: prediction / loss / gradient.
 
 ---
 
@@ -72,7 +72,7 @@ LR depth: (1, 32, 32)
 
 ### 2.3 RGB Guidance
 
-In v5.6, the model uses raw RGB guidance:
+The model uses raw RGB guidance:
 
 ```python
 rgb_input = np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))
@@ -107,8 +107,6 @@ LR Depth (B,1,H/8,W/8)          RGB (B,3,H,W)
           |                            |
           +---- interleaved cross-attention ----+
                                                |
-          Depth Mamba                   RGB Mamba
-                  \                       /
                    final cross-attention
                             |
                        PixelShuffle x4
@@ -118,7 +116,7 @@ LR Depth (B,1,H/8,W/8)          RGB (B,3,H,W)
                   SR Depth (B,1,H,W)
 ```
 
-The network keeps both branches at `H/4 x W/4` feature resolution after embedding. There is no patch merging in the current main model.
+The network keeps both branches at `H/4 x W/4` feature resolution after embedding. There is no patch merging in the current main model. In v5.7, the dual MambaBlocks were removed: encoder outputs fuse directly via cross-attention.
 
 ---
 
@@ -185,12 +183,7 @@ The cross-attention block follows the A2GS-style design:
 
 ### 4.4 Mamba Refinement
 
-After the final encoder stage:
-
-- Depth features are refined by `depth_mamba`.
-- RGB features are refined by `rgb_mamba`.
-
-The current `MambaBlock` is a lightweight 2D approximation with directional depthwise convolutions and gating. It is not a full selective scan implementation.
+In v5.7, the Mamba refinement was removed. Encoder outputs (d4 seq, g4 2D) feed directly into the final fusion.
 
 ### 4.5 Final Fusion and Upsampling
 
@@ -227,23 +220,24 @@ Defined in `config.py`.
 
 | Item | Value |
 |---|---:|
-| Version | 5.6 |
+| Version | 5.7 |
 | Scale | 8 |
 | Train split | 1000 |
 | Test split | Remaining samples |
 | Crop size | 256 |
-| Repeat | 20 |
+| Repeat | 32 |
 | Batch size | 8 |
 | Epochs | 300 |
 | Learning rate | 5e-4 |
-| LR scheduler | StepLR |
-| LR step | 100 |
-| LR gamma | 0.5 |
-| Optimizer | AdamW |
-| Weight decay | 1e-4 |
+| LR scheduler | ReduceLROnPlateau |
+| LR factor | 0.5 |
+| LR patience | 10 |
+| LR min | 1e-6 |
+| Optimizer | Adam |
+| Weight decay | 0 |
 | Gradient clipping | Disabled |
 | Loss | L1 + 0.1 * gradient loss |
-| AMP | Enabled |
+| AMP | Disabled (FP32) |
 | RGB input | Raw RGB |
 | LR degradation | Bicubic downsampling |
 | Validation interval | Every 5 epochs through epoch 150, then every 10 epochs |
@@ -254,10 +248,10 @@ When resuming from an older checkpoint, the optimizer parameter groups are re-sy
 
 ## 6. Parameter Count
 
-Measured with the current v5.6 configuration:
+Measured with the current v5.7 configuration:
 
 ```text
-Total trainable parameters: 2,064,303
+Total trainable parameters: 2,011,053
 ```
 
 Approximate top-level distribution:
@@ -272,11 +266,9 @@ Approximate top-level distribution:
 | rgb_stages | 1,240,345 |
 | cross_d_blocks | 147,232 |
 | cross_c_blocks | 147,232 |
-| depth_mamba | 26,625 |
-| rgb_mamba | 26,625 |
 | fusion_cross | 36,808 |
 | upsample | 83,098 |
-| Total | 2,064,303 |
+| Total | 2,011,053 |
 
 The RGB branch accounts for roughly 60% of the model parameters.
 
@@ -326,7 +318,7 @@ The repository still contains several modules kept for compatibility or ablation
 - `BranchDecoder`
 - `CBAM`
 - `SwinEncoder`
-- `MambaDecoder`
+- `MambaDecoder` (removed from main model in v5.7)
 - `A2GSTranFusion`
 - `CrossAttention`
 
@@ -336,7 +328,7 @@ They are not used by the current `CDSRNet` forward path. If the project is prepa
 
 ## 9. Recommended Ablations
 
-To validate whether the v5.6 structure is necessary, run:
+To validate whether the current structure is necessary, run:
 
 1. Raw RGB vs Sobel edge guidance.
 2. CHRG depth `[5,5,5,5,5]` vs lighter `[3,3,3,3,3]` or `[2,2,2,2,2]`.
@@ -361,4 +353,5 @@ These ablations are important because the current RGB branch is expressive, but 
 | v5.3 | Added DWConv inside Swin MLP, changed crop to 256 and window to 8. |
 | v5.4 | Increased embed dimension to 64, unified heads to 2, and updated training/test config. |
 | v5.5 | Switched default guidance to raw RGB, changed LR depth degradation to bicubic, and fixed crop alignment for 8x SR. |
-| v5.6 | Fixed the global residual to use raw bicubic depth, switched training to AdamW, added non-finite guards, changed validation cadence, and updated current training hyperparameters. |
+| v5.6 | Fixed global residual, AdamW, NaN guards, validation cadence. |
+| v5.7 | Removed dual MambaBlocks (encoder→direct fusion), Adam (wd=0), ReduceLROnPlateau, FP32, three-layer NaN guard. |

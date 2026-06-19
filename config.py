@@ -34,16 +34,12 @@ class Config:
     # fusion
     fusion_num_heads = 8
 
-    # Mamba decoder
-    mamba_d_state = 16
-    mamba_expand = 2
-
     # loss weights
     loss_l1_weight = 1.0
     loss_edge_weight = 0.1
 
     # version tag (saved in checkpoints, printed in logs)
-    model_version = "5.6"
+    model_version = "5.7"
 
     # checkpoint (portable: relative to project root)
     checkpoint_dir = os.path.join(_project_root, "checkpoints")

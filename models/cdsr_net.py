@@ -1,7 +1,7 @@
 """
-CDSR-Net v5.0: Color-guided Depth Super-Resolution Network.
+CDSR-Net v5.7: Color-guided Depth Super-Resolution Network.
 Preprocessing convs + Swin depth encoder + EchoSR CHRG RGB encoder +
-A2GS interleaved cross-attention + dual Mamba + cross-attn fusion.
+A2GS interleaved cross-attention + cross-attn fusion (no Mamba).
 
 Architecture:
   depth PreConv ─┐                            RGB PreConv ─┐
@@ -21,9 +21,7 @@ Architecture:
                  │     g3 (2D)                     │         │
                  └───────┼── cross_c3 ──→ CHRG_stage4 ─→ g4 │
                          │                      (2D)         │
-                     MambaBlock                         MambaBlock
-                      (seq→2D)                            (2D)
-                         │                                  │
+                         │                                   │
                          └──→ CrossAttn(depth Q, RGB KV) ─→ Upsample → HR
 """
 import torch
@@ -32,7 +30,6 @@ import torch.nn.functional as F
 
 from .swin_encoder import SwinStage, PatchEmbed
 from .fusion import A2GSCrossTransformerBlock
-from .mamba_decoder import MambaBlock
 from .echosr import CHRG
 
 
@@ -86,12 +83,12 @@ class CBAM(nn.Module):
 
 
 class CDSRNet(nn.Module):
-    """CDSR-Net v5.0: Preprocessing convs + Swin depth encoder + EchoSR CHRG RGB encoder.
+    """CDSR-Net v5.7: Swin depth encoder + EchoSR CHRG RGB encoder + cross-attn fusion.
 
     5 depth SwinStages (2 SwinBlocks each) + 5 RGB CHRGs (5 CHBs each).
     4 cross_d + 4 cross_c blocks in A2GS interleaved order.
-    Dual MambaBlocks refine features, then cross-attention (depth Q, RGB KV)
-    fuses the two branches before upsampling to HR.
+    Encoder outputs fused directly via cross-attention, then upsampled to HR.
+    (No Mamba refinement — removed in v5.7.)
     """
 
     def __init__(self,
@@ -103,8 +100,6 @@ class CDSRNet(nn.Module):
                  drop_path_rate: float = 0.1,
                  fusion_num_heads: int = 8,
                  cross_mlp_ratio: float = 2.0,
-                 d_state: int = 16,
-                 expand: int = 2,
                  scale: int = 8,
                  chrg_depths: list = None,
                  chrg_mlp_ratio: float = 1.5):
@@ -177,10 +172,6 @@ class CDSRNet(nn.Module):
                                               fusion_num_heads, cross_mlp_ratio)
                 )
 
-        # Dual MambaBlocks (unshared, for depth and RGB branch refinement)
-        self.depth_mamba = MambaBlock(embed_dim, d_state, expand)
-        self.rgb_mamba = MambaBlock(embed_dim, d_state, expand)
-
         # Cross-attention fusion: depth features as Q, RGB features as K/V
         self.fusion_cross = A2GSCrossTransformerBlock(embed_dim, embed_dim,
                                                       fusion_num_heads, cross_mlp_ratio)
@@ -237,17 +228,9 @@ class CDSRNet(nn.Module):
             y = y_seq.transpose(1, 2).contiguous().view(B, -1, H, W)
             y = self.rgb_stages[i + 1](y)                           # g_{i+1} (2D)
 
-        # Mamba refinement on each branch (y is already 2D)
-        x_2d = x.transpose(1, 2).contiguous().view(B, -1, H, W)
-        x_mamba = self.depth_mamba(x_2d)
-        y_mamba = self.rgb_mamba(y)
-
-        # Back to sequence format for cross-attention
-        x_seq = x_mamba.flatten(2).transpose(1, 2)
-        y_seq = y_mamba.flatten(2).transpose(1, 2)
-
-        # Cross-attention fusion: depth Q, RGB KV
-        fused = self.fusion_cross(x_seq, y_seq, x_size)
+        # Cross-attention fusion: depth Q (seq), RGB KV (2D→seq)
+        y_seq = y.flatten(2).transpose(1, 2)
+        fused = self.fusion_cross(x, y_seq, x_size)
 
         # Upsample to HR
         fused_2d = fused.transpose(1, 2).contiguous().view(B, -1, H, W)
@@ -269,8 +252,6 @@ def build_cdsr_net(scale: int = 8, **kwargs) -> CDSRNet:
         drop_path_rate=0.1,
         fusion_num_heads=8,
         cross_mlp_ratio=2.0,
-        d_state=16,
-        expand=2,
         scale=scale,
     )
     defaults.update(kwargs)
