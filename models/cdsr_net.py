@@ -1,7 +1,8 @@
 """
 CDSR-Net v5.7: Color-guided Depth Super-Resolution Network.
 Preprocessing convs + Swin depth encoder + EchoSR CHRG RGB encoder +
-A2GS interleaved cross-attention + cross-attn fusion (no Mamba).
+A2GS interleaved cross-attention (3 pairs, matching A2GS) +
+depth feature reuse + channel attention fusion.
 
 Architecture:
   depth PreConv ─┐                            RGB PreConv ─┐
@@ -15,14 +16,14 @@ Architecture:
   depth_stage1 ─→ d1 (seq)  │                                 │
                  ┌── cross_c0(RGB Q, depth KV)───► CHRG_stage1│
                  │                                         g1 (2D)
-                 │              ...                          │
-                 │       ┌── cross_d3 ─→ depth_stage4 ─→ d4  │
+                 │              (×3 total)                    │
+                 │       ┌── cross_d2 ─→ depth_stage3 ─→ d3  │
                  │       │                        │         │
-                 │     g3 (2D)                     │         │
-                 └───────┼── cross_c3 ──→ CHRG_stage4 ─→ g4 │
+                 │     g2 (2D)                     │         │
+                 └───────┼── cross_c2 ──→ CHRG_stage3 ─→ g3 │
                          │                      (2D)         │
                          │                                   │
-                         └──→ CrossAttn(depth Q, RGB KV) ─→ Upsample → HR
+                Concat[d0,d1,d2,d3] → project → ChannelAttn → Upsample → HR
 """
 import torch
 import torch.nn as nn
@@ -31,6 +32,7 @@ import torch.nn.functional as F
 from .swin_encoder import SwinStage, PatchEmbed
 from .fusion import A2GSCrossTransformerBlock
 from .echosr import CHRG
+from .channel_attention import ChannelAttentionFusion
 
 
 class BranchDecoder(nn.Module):
@@ -85,10 +87,10 @@ class CBAM(nn.Module):
 class CDSRNet(nn.Module):
     """CDSR-Net v5.7: Swin depth encoder + EchoSR CHRG RGB encoder + cross-attn fusion.
 
-    5 depth SwinStages (2 SwinBlocks each) + 5 RGB CHRGs (5 CHBs each).
-    4 cross_d + 4 cross_c blocks in A2GS interleaved order.
-    Encoder outputs fused directly via cross-attention, then upsampled to HR.
-    (No Mamba refinement — removed in v5.7.)
+    4 depth SwinStages (2 SwinBlocks each) + 4 RGB CHRGs (5 CHBs each).
+    3 cross_d + 3 cross_c blocks in A2GS interleaved order (matching A2GS).
+    Depth features from all 4 stages are concatenated (A2GS-style reuse),
+    then fused with the final RGB features via channel attention.
     """
 
     def __init__(self,
@@ -109,20 +111,13 @@ class CDSRNet(nn.Module):
         if num_heads is None:
             num_heads = [3, 6, 12, 24]
 
-        self.num_stages = len(block_depths)
+        self.num_stages = len(block_depths)  # 4
+        self.total_stages = self.num_stages
         self.patch_size = 4
-
-        # Expand to 5 stages: initial + 4 cross-attn groups
-        if len(block_depths) == 4:
-            block_depths = [2] + block_depths  # [2, 2, 2, 2, 2]
-        if len(num_heads) == 4:
-            num_heads = num_heads + [num_heads[-1]]  # [3, 6, 12, 24, 24]
-
-        self.total_stages = len(block_depths)
 
         # CHRG depths: 5 CHBs per group (EchoSR paper default)
         if chrg_depths is None:
-            chrg_depths = [5] * self.total_stages  # [5, 5, 5, 5, 5]
+            chrg_depths = [5] * self.total_stages  # [5, 5, 5, 5]
 
         # Preprocessing conv layers (before PatchEmbed)
         self.depth_pre = nn.Conv2d(1, 1, 3, padding=1)
@@ -132,7 +127,7 @@ class CDSRNet(nn.Module):
         self.depth_patch_embed = PatchEmbed(4, 1, embed_dim)
         self.rgb_embed = nn.Conv2d(3, embed_dim, 4, stride=4)
 
-        # Drop path rates: 10 depth SwinBlocks (5 stages × 2 blocks)
+        # Drop path rates
         depth_total_blocks = sum(block_depths)
         dpr = [drop_path_rate * i / max(1, depth_total_blocks - 1)
                for i in range(depth_total_blocks)]
@@ -155,13 +150,13 @@ class CDSRNet(nn.Module):
                           drop_path_rates=stage_dpr)
             )
 
-            # RGB stage: EchoSR CHRG (5 CHBs per group, matching EchoSR paper)
+            # RGB stage: EchoSR CHRG
             self.rgb_stages.append(
                 CHRG(dim=embed_dim, depth=chrg_depths[i],
                      mlp_ratio=chrg_mlp_ratio, drop_path=drop_path_rate)
             )
 
-            # Cross-attention (4 pairs for 5 stages)
+            # Cross-attention (3 pairs for 4 stages, matching A2GS)
             if i < self.total_stages - 1:
                 self.cross_d_blocks.append(
                     A2GSCrossTransformerBlock(embed_dim, embed_dim,
@@ -172,9 +167,11 @@ class CDSRNet(nn.Module):
                                               fusion_num_heads, cross_mlp_ratio)
                 )
 
-        # Cross-attention fusion: depth features as Q, RGB features as K/V
-        self.fusion_cross = A2GSCrossTransformerBlock(embed_dim, embed_dim,
-                                                      fusion_num_heads, cross_mlp_ratio)
+        # Project concatenated depth features: 4×C → C
+        self.depth_concat_proj = nn.Conv2d(embed_dim * self.total_stages, embed_dim, 1)
+
+        # Channel attention fusion: projected depth + RGB
+        self.fusion = ChannelAttentionFusion(embed_dim)
 
         # Upsampling: H/4 → H
         self.upsample = nn.Sequential(
@@ -208,35 +205,40 @@ class CDSRNet(nn.Module):
 
         # Patch embedding (depth: seq) + conv embed (RGB: 2D)
         x, H, W = self.depth_patch_embed(lr_depth_hr)
-        y = self.rgb_embed(rgb)                                    # (B,48,H/4,W/4)
+        y = self.rgb_embed(rgb)
         x_size = (H, W)
 
         # Stage 0: initial transformer (before any cross-attention)
         x, H, W = self.depth_stages[0](x, H, W)                   # d0 (seq)
         y = self.rgb_stages[0](y)                                  # g0 (2D)
 
-        # 4 groups: cross_d → depth_stage → cross_c → rgb_stage
+        # Collect depth features from all stages (A2GS-style reuse)
+        depth_feats = [x]  # d0
+
+        # 3 groups: cross_d → depth_stage → cross_c → rgb_stage
         for i in range(self.total_stages - 1):
-            # cross_d: depth Q, RGB KV — RGB needs seq
+            # cross_d: depth Q, RGB KV
             y_seq = y.flatten(2).transpose(1, 2)
             x = self.cross_d_blocks[i](x, y_seq, x_size)
             x, H, W = self.depth_stages[i + 1](x, H, W)            # d_{i+1}
+            depth_feats.append(x)                                   # store
 
-            # cross_c: RGB Q, depth KV — RGB in/out seq, convert back to 2D
+            # cross_c: RGB Q, depth KV
             y_seq = y.flatten(2).transpose(1, 2)
             y_seq = self.cross_c_blocks[i](y_seq, x, x_size)
             y = y_seq.transpose(1, 2).contiguous().view(B, -1, H, W)
             y = self.rgb_stages[i + 1](y)                           # g_{i+1} (2D)
 
-        # Cross-attention fusion: depth Q (seq), RGB KV (2D→seq)
-        y_seq = y.flatten(2).transpose(1, 2)
-        fused = self.fusion_cross(x, y_seq, x_size)
+        # Concat all depth features: (B, N, C) × 4 → (B, N, 4C) → 2D → project
+        x_cat = torch.cat(depth_feats, dim=2)                       # (B, N, 4C)
+        x_cat = x_cat.transpose(1, 2).contiguous().view(B, -1, H, W)  # (B, 4C, H, W)
+        x_cat = self.depth_concat_proj(x_cat)                       # (B, C, H, W)
 
-        # Upsample to HR
-        fused_2d = fused.transpose(1, 2).contiguous().view(B, -1, H, W)
+        # Channel attention fusion: projected depth + RGB
+        fused_2d = self.fusion(x_cat, y)
         out = self.upsample(fused_2d)
 
-        # Global residual uses the raw bicubic-upsampled LR depth.
+        # Global residual
         out = out + lr_depth_res
         return out
 
