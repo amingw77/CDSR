@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import cfg
 from models import build_cdsr_net
 from data import NYUDepthSR
-from utils.metrics import compute_rmse, compute_mae, compute_rel, compute_delta, compute_gradient_loss
+from utils.metrics import compute_rmse
 
 
 class TeeLogger:
@@ -45,7 +45,6 @@ class TeeLogger:
 def train_epoch(model, loader, optimizer, device, epoch, total_epochs):
     model.train()
     total_l1 = 0.0
-    total_edge = 0.0
     count = 0
     skipped = 0
 
@@ -58,14 +57,18 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs):
 
         optimizer.zero_grad(set_to_none=True)
 
-        pred = model(lr_depth, rgb)
-        if not torch.isfinite(pred).all():
+        depth_sr, rgb_sr, fused_sr = model(lr_depth, rgb)
+        if not torch.isfinite(fused_sr).all():
             skipped += 1
             print(f"[WARN] Non-finite prediction at epoch {epoch}, batch {batch_idx}; skipping batch")
             continue
-        l1_loss = F.l1_loss(pred, hr_depth)
-        edge_loss = compute_gradient_loss(pred, hr_depth)
-        loss = cfg.loss_l1_weight * l1_loss + cfg.loss_edge_weight * edge_loss
+
+        # A2GS-style loss: 0.5*L1_depth + 0.5*L1_rgb + L1_fused
+        l1_d = F.l1_loss(depth_sr, hr_depth)
+        l1_r = F.l1_loss(rgb_sr, hr_depth)
+        l1_f = F.l1_loss(fused_sr, hr_depth)
+        l1_loss = 0.5 * l1_d + 0.5 * l1_r + l1_f
+        loss = l1_loss
         if not torch.isfinite(loss):
             skipped += 1
             print(f"[WARN] Non-finite loss at epoch {epoch}, batch {batch_idx}; skipping batch")
@@ -88,23 +91,22 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs):
         optimizer.step()
 
         total_l1 += l1_loss.item() * lr_depth.size(0)
-        total_edge += edge_loss.item() * lr_depth.size(0)
         count += lr_depth.size(0)
 
-        pbar.set_postfix({"L1": f"{total_l1/count:.4f}", "Edge": f"{total_edge/count:.4f}"})
+        pbar.set_postfix({"L1": f"{total_l1/count:.4f}"})
 
     if skipped > 0:
         print(f"[WARN] Skipped {skipped} non-finite training batches in epoch {epoch}")
     if count == 0:
         raise RuntimeError(f"All training batches were skipped in epoch {epoch}")
 
-    return total_l1 / count, total_edge / count
+    return total_l1 / count
 
 
 @torch.no_grad()
 def validate(model, loader, device):
     model.eval()
-    metrics = {"rmse": 0.0, "mae": 0.0, "rel": 0.0, "delta1": 0.0}
+    metrics = {"rmse": 0.0}
     count = 0
     skipped = 0
 
@@ -114,7 +116,7 @@ def validate(model, loader, device):
         rgb = rgb.to(device)
         hr_depth = hr_depth.to(device)
 
-        pred = model(lr_depth, rgb)
+        _, _, pred = model(lr_depth, rgb)
         if not torch.isfinite(pred).all():
             skipped += pred.size(0)
             print(f"[WARN] Non-finite prediction during validation at batch {batch_idx}; skipping batch")
@@ -131,9 +133,6 @@ def validate(model, loader, device):
             dm = dmin[i].to(device)
             dx = dmax[i].to(device)
             metrics["rmse"] += compute_rmse(p, t, dm, dx, eval_mode=True)
-            metrics["mae"] += compute_mae(p, t, dm, dx, eval_mode=True)
-            metrics["rel"] += compute_rel(p, t, dm, dx, eval_mode=True)
-            metrics["delta1"] += compute_delta(p, t, dm, dx, eval_mode=True)
             count += 1
 
     if skipped > 0:
@@ -263,7 +262,7 @@ def main():
 
     try:
         for epoch in range(start_epoch, args.epochs):
-            l1_loss, edge_loss = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.epochs)
+            l1_loss = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.epochs)
             scheduler.step(l1_loss)
 
             # Save last checkpoint every epoch (always resumable)
@@ -277,9 +276,8 @@ def main():
             if current_epoch % val_interval == 0 or epoch == 0:
                 val_metrics = validate(model, test_loader, device)
                 rmse = val_metrics["rmse"]
-                print(f"[Epoch {current_epoch:3d}] L1: {l1_loss:.4f}  Edge: {edge_loss:.4f}  "
-                      f"RMSE: {rmse:.4f}  MAE: {val_metrics['mae']:.4f}  "
-                      f"Rel: {val_metrics['rel']:.4f}  δ1: {val_metrics['delta1']:.1f}%")
+                print(f"[Epoch {current_epoch:3d}] L1: {l1_loss:.4f}  "
+                      f"RMSE: {rmse:.4f}")
 
                 if rmse < best_rmse:
                     best_rmse = rmse
@@ -288,7 +286,7 @@ def main():
                         epoch, model, optimizer, scheduler, best_rmse
                     )
             else:
-                print(f"[Epoch {epoch + 1:3d}] L1: {l1_loss:.4f}  Edge: {edge_loss:.4f}")
+                print(f"[Epoch {epoch + 1:3d}] L1: {l1_loss:.4f}")
 
         # Final save
         save_checkpoint(

@@ -36,7 +36,7 @@ class Config:
 
     # loss weights
     loss_l1_weight = 1.0
-    loss_edge_weight = 0.1
+    loss_edge_weight = 0.0
 
     # version tag (saved in checkpoints, printed in logs)
     model_version = "5.7.2"

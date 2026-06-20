@@ -44,7 +44,7 @@ def evaluate(model, loader, dataset, device, results_dir: str = None):
         hr_depth = hr_depth.to(device)
 
         if model is not None:
-            pred = model(lr_depth, rgb)
+            _, _, pred = model(lr_depth, rgb)
         else:
             pred = F.interpolate(lr_depth, size=hr_depth.shape[2:],
                                  mode="bicubic", align_corners=False)

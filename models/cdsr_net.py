@@ -32,7 +32,6 @@ import torch.nn.functional as F
 from .swin_encoder import SwinStage, PatchEmbed
 from .fusion import A2GSCrossTransformerBlock
 from .echosr import CHRG
-from .channel_attention import ChannelAttentionFusion
 
 
 class BranchDecoder(nn.Module):
@@ -170,16 +169,36 @@ class CDSRNet(nn.Module):
         # Project concatenated depth features: 4×C → C
         self.depth_concat_proj = nn.Conv2d(embed_dim * self.total_stages, embed_dim, 1)
 
-        # Channel attention fusion: projected depth + RGB
-        self.fusion = ChannelAttentionFusion(embed_dim)
-
-        # Upsampling: H/4 → H
-        self.upsample = nn.Sequential(
-            nn.Conv2d(embed_dim, 64, 3, padding=1),
+        # A2GS-style three-output supervision (each branch has its own feature head + output)
+        feat_dim = 64
+        self.feat_depth = nn.Sequential(
+            nn.Conv2d(embed_dim, feat_dim, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(64, 64, 3, padding=1),
+            nn.Conv2d(feat_dim, feat_dim, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(64, 16, 3, padding=1),
+        )
+        self.feat_rgb = nn.Sequential(
+            nn.Conv2d(embed_dim, feat_dim, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(feat_dim, feat_dim, 3, padding=1),
+            nn.GELU(),
+        )
+        # Channel attention + conv for fusion
+        self.fusion_ca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(feat_dim * 2, feat_dim // 8, 1),
+            nn.ReLU(),
+            nn.Conv2d(feat_dim // 8, feat_dim * 2, 1),
+            nn.Sigmoid(),
+        )
+        self.fusion_conv = nn.Conv2d(feat_dim * 2, feat_dim, 3, padding=1)
+        self.feat_fused = nn.Sequential(
+            nn.Conv2d(feat_dim, feat_dim, 3, padding=1),
+            nn.GELU(),
+        )
+        # Shared PixelShuffle + output conv
+        self.to_depth = nn.Sequential(
+            nn.Conv2d(feat_dim, 16, 3, padding=1),
             nn.PixelShuffle(4),
             nn.Conv2d(1, 1, 3, padding=1),
         )
@@ -234,13 +253,23 @@ class CDSRNet(nn.Module):
         x_cat = x_cat.transpose(1, 2).contiguous().view(B, -1, H, W)  # (B, 4C, H, W)
         x_cat = self.depth_concat_proj(x_cat)                       # (B, C, H, W)
 
-        # Channel attention fusion: projected depth + RGB
-        fused_2d = self.fusion(x_cat, y)
-        out = self.upsample(fused_2d)
+        # A2GS-style three-output supervision
+        # Depth branch: concat features → feat → to_depth
+        fd = self.feat_depth(x_cat)
+        depth_sr = self.to_depth(fd) + lr_depth_res
 
-        # Global residual
-        out = out + lr_depth_res
-        return out
+        # RGB branch: final RGB features → feat → to_depth
+        fr = self.feat_rgb(y)
+        rgb_sr = self.to_depth(fr) + lr_depth_res
+
+        # Fused: concat(fd, fr) → channel attention → conv → feat → to_depth
+        cat = torch.cat([fd, fr], dim=1)             # (B, 128, H, W)
+        ca = self.fusion_ca(cat)
+        fused_feat = self.fusion_conv(cat * ca)       # (B, 64, H, W)
+        fused_feat = self.feat_fused(fused_feat)
+        fused_sr = self.to_depth(fused_feat) + lr_depth_res
+
+        return depth_sr, rgb_sr, fused_sr
 
 
 def build_cdsr_net(scale: int = 8, **kwargs) -> CDSRNet:
